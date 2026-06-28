@@ -1,0 +1,14 @@
+{
+  "name": "wfm-live-scraper",
+  "version": "1.0.0",
+  "description": "Headless Playwright scraper for Aircall Live Monitoring — writes to Supabase.",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js",
+    "install-browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.44.0"
+  }
+}
