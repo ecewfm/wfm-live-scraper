@@ -1,312 +1,301 @@
-// scraper.js — WFM Live Scraper
-// Supports: aircall, talkdesk (Ashley Phones)
+// File: scraper.js
+// Path: C:\Users\rodolfo.luga\Documents\Node Projects\wfm-live-scraper\scraper.js
+// scraper.js — WFM Live Scraper v3
+// Per-account scraper modules in scrapers/<account-id>/index.js
 //
-// Usage:
-//   node scraper.js                               — always headless
-//   HEADLESS=false node scraper.js                — visible browser
-//   HEADLESS=false AUTO_HIDE=true node scraper.js — visible, hides after first scrape
-//
-// Commands (type + Enter):
-//   hide <id>    — hide browser window from screen AND taskbar
-//   show <id>    — restore browser window
-//   hide / show  — applies to all accounts
-//   retry <id>   — immediately re-scrape
-//   status       — print current KPI state
-//   help         — list commands
+// Commands (type + Enter while running):
+//   add <name>       — create scrapers/<name>/ from template, add to config
+//   start <name>     — start a configured account (after editing its scraper file)
+//   reload <name>    — hot-reload that account's scraper file (no full restart)
+//   pause <name>     — pause scraping (browser stays alive, session kept)
+//   resume <name>    — resume a paused account
+//   remove <name>    — stop and remove from active list (files stay on disk)
+//   list             — show all accounts, scraper file, and current state
+//   hide [name]      — minimize + hide from taskbar (all if no name)
+//   show [name]      — restore browser window
+//   retry <name>     — immediately re-scrape
+//   status           — print KPI summary for all accounts
+//   help             — list all commands
 
-require('dotenv').config();
+require('dotenv').config()
 
-const fs   = require('fs');
-const path = require('path');
+const fs   = require('fs')
+const path = require('path')
 
-const { launchForAccount, login, isSessionExpired, gotoLiveMonitoring } = require('./lib/browser');
-const { scrapeWithRetry }              = require('./lib/scrape');
-const { writeSnapshot }                = require('./lib/db');
-const { runTalkdeskAccount }           = require('./lib/scrape-talkdesk');
-const TerminalDash                     = require('./lib/terminal-dash');
-const { hideWindow, showWindow, getPid } = require('./lib/win-window');
+const TerminalDash   = require('./lib/terminal-dash')
+const AccountRunner  = require('./lib/account-runner')
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const CONFIG_PATH = path.join(__dirname, 'config.json');
-if (!fs.existsSync(CONFIG_PATH)) { console.error('❌ config.json not found.'); process.exit(1); }
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-  console.error('❌ SUPABASE_URL and SUPABASE_KEY must be set in .env'); process.exit(1);
+// ── Paths ─────────────────────────────────────────────────────────────────────
+const CONFIG_PATH   = path.join(__dirname, 'config.json')
+const SCRAPERS_DIR  = path.join(__dirname, 'scrapers')
+const TEMPLATE_DIR  = path.join(SCRAPERS_DIR, '_template')
+const SESSIONS_DIR  = path.join(__dirname, 'sessions')
+
+// ── Validation ────────────────────────────────────────────────────────────────
+if (!fs.existsSync(CONFIG_PATH)) {
+  console.error('❌  config.json not found.')
+  process.exit(1)
 }
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
+  console.error('❌  SUPABASE_URL and SUPABASE_KEY must be set in .env')
+  process.exit(1)
+}
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true })
 
-const ACCOUNTS    = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-const INTERVAL_MS = parseInt(process.env.SCRAPE_INTERVAL_MS) || 30000;
-const AUTO_HIDE   = process.env.AUTO_HIDE === 'true';
+const ACCOUNTS    = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+const INTERVAL_MS = parseInt(process.env.SCRAPE_INTERVAL_MS) || 30000
 
 // ── Terminal dashboard ────────────────────────────────────────────────────────
-const dash = new TerminalDash(ACCOUNTS, INTERVAL_MS);
-dash.init();
+const dash = new TerminalDash(ACCOUNTS, INTERVAL_MS)
+dash.init()
 
-// ── Command registries ────────────────────────────────────────────────────────
-const retryFns = {};
-const hideFns  = {};
-const showFns  = {};
+// ── Active runners ────────────────────────────────────────────────────────────
+const runners = {}  // accountId → AccountRunner
 
-// ── CDP helpers ───────────────────────────────────────────────────────────────
-async function cdpGetWindowId(context, page) {
+// ── Load scraper module (busts require cache on reload) ───────────────────────
+function loadScraperModule(accountId) {
+  const scraperPath = path.join(SCRAPERS_DIR, accountId, 'index.js')
+  if (!fs.existsSync(scraperPath)) {
+    throw new Error(
+      `No scraper found at scrapers/${accountId}/index.js\n` +
+      `  → Run: add ${accountId}   to create from template\n` +
+      `  → Or create the file manually`
+    )
+  }
+  // Clear require cache so reload gets fresh code
+  const resolved = require.resolve(scraperPath)
+  delete require.cache[resolved]
+  return require(scraperPath)
+}
+
+// ── Start a single account ────────────────────────────────────────────────────
+async function startAccount(account) {
+  const mod    = loadScraperModule(account.id)
+  const runner = new AccountRunner(account, mod, dash)
+  runners[account.id] = runner
+  await runner.init()
+  runner.start()
+}
+
+// ── Command: add <name> ───────────────────────────────────────────────────────
+function cmdAdd(name) {
+  if (!name) { dash.log(null, 'Usage: add <account-name>'); return }
+  if (runners[name]) { dash.log(null, `"${name}" is already running`); return }
+
+  const targetDir = path.join(SCRAPERS_DIR, name)
+  if (!fs.existsSync(targetDir)) {
+    fs.mkdirSync(targetDir, { recursive: true })
+    // Copy template
+    const tmplFile = path.join(TEMPLATE_DIR, 'index.js')
+    const destFile = path.join(targetDir, 'index.js')
+    if (fs.existsSync(tmplFile)) {
+      fs.copyFileSync(tmplFile, destFile)
+      dash.log(null, `✅ Created scrapers/${name}/index.js from template`)
+    } else {
+      fs.writeFileSync(destFile, `// scrapers/${name}/index.js\nmodule.exports = { meta: { type: 'custom' }, async login() {}, async scrape() { return null }, async write() {} }\n`)
+      dash.log(null, `✅ Created scrapers/${name}/index.js (empty)`)
+    }
+  } else {
+    dash.log(null, `scrapers/${name}/ already exists`)
+  }
+
+  // Add to config.json if not there
+  const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+  if (!config.find(a => a.id === name)) {
+    config.push({ id: name, email: '', password: '' })
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2))
+    dash.log(null, `✅ Added "${name}" to config.json (add credentials there)`)
+  }
+
+  // Add to dashboard
+  dash.addAccount(name)
+  dash.log(null, `Next steps:`)
+  dash.log(null, `  1. Edit scrapers/${name}/index.js with your login + scrape logic`)
+  dash.log(null, `  2. Edit config.json to add email/password for "${name}"`)
+  dash.log(null, `  3. Run: start ${name}`)
+}
+
+// ── Command: start <name> ─────────────────────────────────────────────────────
+async function cmdStart(name) {
+  if (!name) { dash.log(null, 'Usage: start <account-name>'); return }
+  if (runners[name]?.timer) { dash.log(null, `"${name}" is already running — use reload to refresh`); return }
+
+  const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+  const account = config.find(a => a.id === name)
+  if (!account) {
+    dash.log(null, `"${name}" not in config.json — run: add ${name}`)
+    return
+  }
+
+  // Add to dashboard if not there
+  if (!dash.accounts.find(a => a.id === name)) dash.addAccount(name)
+
+  dash.log(null, `▶ Starting ${name}...`)
   try {
-    const cdp = await context.newCDPSession(page);
-    const { windowId } = await cdp.send('Browser.getWindowForTarget');
-    return { cdp, windowId };
-  } catch (e) { return null; }
+    await startAccount(account)
+  } catch (err) {
+    dash.error(name, `Failed to start: ${err.message}`)
+  }
 }
 
-async function cdpSetState(cdp, windowId, windowState) {
-  try { await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState } }); } catch (_) {}
+// ── Command: reload <name> ────────────────────────────────────────────────────
+async function cmdReload(name) {
+  if (!name) { dash.log(null, 'Usage: reload <account-name>'); return }
+  const runner = runners[name]
+  if (!runner) { dash.log(null, `"${name}" is not running — use: start ${name}`); return }
+  try {
+    const newMod = loadScraperModule(name)
+    await runner.reload(newMod)
+  } catch (err) {
+    dash.error(name, `Reload failed: ${err.message}`)
+  }
 }
 
-// ── Aircall account runner ────────────────────────────────────────────────────
-async function runAircallAccount(account) {
-  let browser, context, page, sessionPath;
-  let isHeadless  = process.env.HEADLESS !== 'false';
-  let firstScrape = true;
-  let _cdp = null;
-  let _windowId = null;
-
-  async function init(forceHeadless) {
-    const prev = process.env.HEADLESS;
-    if (forceHeadless !== undefined) process.env.HEADLESS = forceHeadless ? 'true' : 'false';
-    ({ browser, context, page, sessionPath } = await launchForAccount(account));
-    process.env.HEADLESS = prev;
-
-    await login(page, context, account, sessionPath);
-    await gotoLiveMonitoring(page, account.id);
-
-    // Set up CDP for window control (only when visible)
-    _cdp = null; _windowId = null;
-    if (!isHeadless) {
-      const r = await cdpGetWindowId(context, page);
-      if (r) { _cdp = r.cdp; _windowId = r.windowId; }
-    }
-
-    dash.log(account.id, `Logged in — ${isHeadless ? 'headless' : 'visible'}`);
-  }
-
-  async function hideBrowser() {
-    if (isHeadless) { dash.log(account.id, 'Already running headless'); return; }
-    if (_cdp && _windowId) {
-      await cdpSetState(_cdp, _windowId, 'minimized');
-    }
-    // Get page title to uniquely identify this Chrome window among multiple instances
-    const title = await page.title().catch(() => '')
-    if (title) dash.log(account.id, `Window title: "${title}"`)
-    const ok = hideWindow(browser, title);
-    dash.log(account.id, ok
-      ? '✅ Hidden from screen and taskbar — scraping continues'
-      : '⚠️ Minimized to taskbar (Win32 hide unavailable)');
-  }
-
-  async function showBrowser() {
-    if (isHeadless) {
-      dash.log(account.id, 'Relaunching with visible window...');
-      isHeadless = false;
-      try { await browser.close(); } catch (_) {}
-      await new Promise(r => setTimeout(r, 1000));
-      await init(false);
-      dash.log(account.id, '✅ Browser is now visible');
-      return;
-    }
-    // Restore from Win32 hide first, then CDP unminimize
-    const title = await page.title().catch(() => '')
-    showWindow(browser, title);
-    await new Promise(r => setTimeout(r, 300));
-    if (_cdp && _windowId) await cdpSetState(_cdp, _windowId, 'normal');
-    dash.log(account.id, '✅ Window restored');
-  }
-
-  async function tick() {
-    try {
-      if (isSessionExpired(page)) {
-        dash.warn(account.id, 'Session expired — re-logging in...');
-        await login(page, context, account, sessionPath);
-        await gotoLiveMonitoring(page, account.id);
-      }
-
-      const scraped = await scrapeWithRetry(page, account.id);
-      if (!scraped) {
-        dash.update(account.id, { time: new Date().toLocaleTimeString(), ok: false, info: 'empty scrape' });
-        return;
-      }
-
-      await writeSnapshot(scraped, account.id);
-
-      // Try every known field name for SLA and queue depth
-      const slaVal     = scraped.sla || scraped.kpis?.sla || scraped.kpi?.sla || scraped.data?.sla || '--';
-      const waitingVal = scraped.callsWaiting ?? scraped.calls_waiting ?? scraped.kpis?.callsWaiting ?? scraped.kpi?.calls_waiting ?? '0';
-
-      dash.update(account.id, {
-        time:    new Date().toLocaleTimeString(),
-        ok:      scraped.hasData,
-        sla:     String(slaVal).replace(/\s+/g, ''),
-        waiting: String(waitingVal),
-        agents:  String(scraped.agents.length),
-        info:    `calls:${scraped.calls.length}`,
-        error:   null
-      });
-
-      if (firstScrape && scraped.hasData && AUTO_HIDE && !isHeadless) {
-        firstScrape = false;
-        dash.log(account.id, '✅ First scrape OK — hiding browser (AUTO_HIDE=true)');
-        setTimeout(hideBrowser, 1500);
-      } else {
-        firstScrape = false;
-      }
-
-    } catch (err) {
-      dash.update(account.id, { time: new Date().toLocaleTimeString(), ok: false, error: err.message.substring(0, 40) });
-      dash.error(account.id, err.message);
-
-      if (err.message.includes('Target closed') || err.message.includes('page has been closed')) {
-        dash.warn(account.id, !isHeadless
-          ? 'Window closed — relaunching headless...'
-          : 'Browser crashed — restarting...');
-        isHeadless = true; _cdp = null; _windowId = null;
-        try { await browser.close(); } catch (_) {}
-        await new Promise(r => setTimeout(r, 3000));
-        await init(true);
-      }
-    }
-  }
-
-  await init();
-  await tick();
-  const timer = setInterval(tick, INTERVAL_MS);
-
-  retryFns[account.id] = tick;
-  hideFns[account.id]  = hideBrowser;
-  showFns[account.id]  = showBrowser;
-
-  return async () => { clearInterval(timer); try { await browser.close(); } catch (_) {} };
-}
-
-// ── Talkdesk account runner ───────────────────────────────────────────────────
-async function runTalkdeskAccountWithDash(account) {
-  const { chromium } = require('playwright');
-
-  account._onUpdate = (data) => {
-    dash.update(account.id, {
-      time:    new Date().toLocaleTimeString(),
-      ok:      data.hasData,
-      sla:     data.sla     || '--',
-      waiting: data.waiting || '0',
-      agents:  String(data.agents || '--'),
-      info:    data.hasData ? `LOBs:${data.lobs}` : 'empty',
-      error:   data.error || null
-    });
-    if (data.logMsg) dash.log(account.id, data.logMsg);
-    if (data.error)  dash.error(account.id, data.error);
-  };
-
-  account._onLog    = (msg) => dash.log(account.id, msg);
-  account._onWarn   = (msg) => dash.warn(account.id, msg);
-  account._onErr    = (msg) => dash.error(account.id, msg);
-  account._autoHide = AUTO_HIDE;
-
-  retryFns[account.id] = () => {
-    if (typeof account._tick === 'function') { dash.log(account.id, 'Retrying...'); account._tick(); }
-    else dash.warn(account.id, 'Not ready yet');
-  };
-  hideFns[account.id] = () => {
-    if (typeof account._hide === 'function') account._hide();
-    else dash.warn(account.id, 'Not ready yet');
-  };
-  showFns[account.id] = () => {
-    if (typeof account._show === 'function') account._show();
-    else dash.warn(account.id, 'Not ready yet');
-  };
-
-  return runTalkdeskAccount(account, { chromium, INTERVAL_MS });
+// ── Command: list ─────────────────────────────────────────────────────────────
+function cmdList() {
+  const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+  dash.log(null, `─── Accounts (${config.length}) ────────────────────────`)
+  config.forEach(a => {
+    const runner = runners[a.id]
+    const scraperPath = path.join(SCRAPERS_DIR, a.id, 'index.js')
+    const fileExists  = fs.existsSync(scraperPath) ? '✅' : '❌ no scraper file'
+    const state = runner
+      ? (runner.paused ? '⏸ paused' : runner.stopped ? '⏹ stopped' : '▶ running')
+      : '○ not started'
+    const type = runner?.module?.meta?.type || '?'
+    dash.log(null, `  ${a.id.padEnd(20)} [${type}]  ${state}  ${fileExists}`)
+  })
+  dash.log(null, `────────────────────────────────────────`)
 }
 
 // ── Command handler ───────────────────────────────────────────────────────────
 function handleCommand(raw) {
-  const line  = raw.trim().replace(/['"]/g, '');
-  if (!line) return;
-  const parts = line.split(/\s+/);
-  const cmd   = parts[0].toLowerCase();
-  const arg   = parts[1];
+  const line  = raw.trim().replace(/['"]/g, '')
+  if (!line) return
+  const parts = line.split(/\s+/)
+  const cmd   = parts[0].toLowerCase()
+  const arg   = parts[1]
 
   switch (cmd) {
+    case 'add':    cmdAdd(arg);    break
+    case 'start':  cmdStart(arg);  break
+    case 'reload': cmdReload(arg); break
+
+    case 'pause': {
+      const ids = arg ? [arg] : Object.keys(runners)
+      ids.forEach(id => {
+        if (!runners[id]) { dash.log(null, `Unknown: ${id}`); return }
+        runners[id].pause()
+      })
+      break
+    }
+
+    case 'resume': {
+      const ids = arg ? [arg] : Object.keys(runners)
+      ids.forEach(id => {
+        if (!runners[id]) { dash.log(null, `Unknown: ${id}`); return }
+        runners[id].resume()
+      })
+      break
+    }
+
+    case 'remove': {
+      if (!arg) { dash.log(null, 'Usage: remove <name>'); break }
+      const runner = runners[arg]
+      if (!runner) { dash.log(null, `"${arg}" is not running`); break }
+      runner.stop().then(() => {
+        delete runners[arg]
+        dash.removeAccount(arg)
+        dash.log(null, `✅ "${arg}" removed (files kept on disk)`)
+      })
+      break
+    }
+
+    case 'list': cmdList(); break
+
     case 'hide': {
-      const ids = arg ? [arg] : Object.keys(hideFns);
-      if (arg && !hideFns[arg]) { dash.log(null, `Unknown: "${arg}"  Available: ${Object.keys(hideFns).join(', ')}`); return; }
-      ids.forEach(id => hideFns[id]?.());
-      break;
+      const ids = arg ? [arg] : Object.keys(runners)
+      ids.forEach(id => {
+        if (!runners[id]) { dash.log(null, `Unknown: ${id}`); return }
+        runners[id].hide()
+      })
+      break
     }
+
     case 'show': {
-      const ids = arg ? [arg] : Object.keys(showFns);
-      if (arg && !showFns[arg]) { dash.log(null, `Unknown: "${arg}"  Available: ${Object.keys(showFns).join(', ')}`); return; }
-      ids.forEach(id => showFns[id]?.());
-      break;
+      const ids = arg ? [arg] : Object.keys(runners)
+      ids.forEach(id => {
+        if (!runners[id]) { dash.log(null, `Unknown: ${id}`); return }
+        runners[id].show()
+      })
+      break
     }
+
     case 'retry': {
-      if (!arg) { dash.log(null, `Usage: retry <id>  Available: ${Object.keys(retryFns).join(', ')}`); return; }
-      if (!retryFns[arg]) { dash.log(null, `Unknown: "${arg}"`); return; }
-      dash.log(null, `▶ Retrying ${arg}...`); retryFns[arg]();
-      break;
+      if (!arg) { dash.log(null, `Usage: retry <name>  Available: ${Object.keys(runners).join(', ')}`); break }
+      if (!runners[arg]) { dash.log(null, `Unknown: "${arg}"`); break }
+      dash.log(null, `▶ Retrying ${arg}...`)
+      runners[arg].tick()
+      break
     }
-    case 'status':
-      ACCOUNTS.forEach(a => {
-        const s  = dash.states[a.id];
-        const st = s.error ? `❌ ${s.error}` : s.ok ? `✅ SLA:${s.sla} Q:${s.waiting} Agt:${s.agents}` : `⏳ ${s.info}`;
-        dash.log(null, `${a.id.padEnd(20)} ${s.time || '--:--'}  ${st}`);
-      });
-      break;
+
+    case 'status': {
+      Object.keys(runners).forEach(id => {
+        const s  = dash.states[id] || {}
+        const st = s.error ? `❌ ${s.error}` : s.ok ? `✅ SLA:${s.sla} Q:${s.waiting} Agt:${s.agents}` : `⏳ ${s.info}`
+        dash.log(null, `${id.padEnd(20)} ${s.time || '--:--'}  ${st}`)
+      })
+      break
+    }
+
     case 'help': case '?':
-      dash.log(null, 'hide <id>  |  show <id>  |  retry <id>  |  status  |  help');
-      dash.log(null, `Accounts : ${ACCOUNTS.map(a => a.id).join(', ')}`);
-      break;
+      dash.log(null, 'add | start | reload | pause | resume | remove | list | hide | show | retry | status | help')
+      dash.log(null, `Active: ${Object.keys(runners).join(', ') || '(none)'}`)
+      break
+
     default:
-      dash.log(null, `Unknown: "${cmd}"  — type help`);
+      dash.log(null, `Unknown: "${cmd}" — type help`)
   }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-(async () => {
-  const cleanups = [];
-  try {
-    for (const account of ACCOUNTS) {
-      const type = account.type || 'aircall';
-      dash.update(account.id, { info: `starting (${type})...` });
-      if (type === 'talkdesk') {
-        runTalkdeskAccountWithDash(account).catch(err => {
-          dash.error(account.id, `Fatal: ${err.message}`);
-          dash.update(account.id, { ok: false, error: err.message.substring(0, 40) });
-        });
-      } else {
-        const cleanup = await runAircallAccount(account);
-        cleanups.push(cleanup);
-      }
+;(async () => {
+  // Start all accounts from config.json
+  for (const account of ACCOUNTS) {
+    const scraperPath = path.join(SCRAPERS_DIR, account.id, 'index.js')
+    if (!fs.existsSync(scraperPath)) {
+      dash.warn(account.id, `No scraper file — run: add ${account.id}  then: start ${account.id}`)
+      continue
     }
-  } catch (err) {
-    dash.error(null, `Fatal: ${err.message}`);
-    process.exit(1);
+    try {
+      await startAccount(account)
+    } catch (err) {
+      dash.error(account.id, `Startup failed: ${err.message}`)
+    }
   }
 
-  process.stdin.resume();
-  process.stdin.setEncoding('utf8');
-  let _buf = '';
+  // stdin commands
+  process.stdin.resume()
+  process.stdin.setEncoding('utf8')
+  let _buf = ''
   process.stdin.on('data', chunk => {
-    _buf += chunk;
-    const lines = _buf.split(/\r?\n/);
-    _buf = lines.pop();
-    lines.forEach(l => handleCommand(l));
-  });
+    _buf += chunk
+    const lines = _buf.split(/\r?\n/)
+    _buf = lines.pop()
+    lines.forEach(l => handleCommand(l))
+  })
 
   setTimeout(() => {
-    if (process.env.HEADLESS === 'false')
-      dash.log(null, '👁  Visible mode — type "hide <id>" to hide, "show <id>" to restore');
-    dash.log(null, 'Commands: hide <id>  |  show <id>  |  retry <id>  |  status  |  help');
-  }, 2000);
+    dash.log(null, 'Commands: add | start | reload | pause | resume | remove | list | hide | show | retry | status | help')
+  }, 2000)
 
+  // Graceful shutdown
   process.on('SIGINT', async () => {
-    dash.log(null, 'Shutting down...');
-    for (const cleanup of cleanups) { try { await cleanup(); } catch (_) {} }
-    process.stdout.write('\x1b[r\x1b[?25h\n');
-    process.exit(0);
-  });
-})();
+    dash.log(null, 'Shutting down...')
+    for (const runner of Object.values(runners)) {
+      try { await runner.stop() } catch (_) {}
+    }
+    process.stdout.write('\x1b[r\x1b[?25h\n')
+    process.exit(0)
+  })
+})()
