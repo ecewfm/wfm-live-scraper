@@ -81,6 +81,65 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 - `wfm_active_calls` — **DELETE all for account_id, then INSERT** each cycle
   (this is the table that corrupts under concurrent writers — see rule 1).
 
+## First-time server setup (bootstrapping a fresh always-on PC)
+
+Do this ONCE on a new server PC. Assumes Windows, locked-screen, always powered on.
+
+**1. Prerequisites**
+```powershell
+# Install Node.js LTS (>=20) and Git first (from nodejs.org / git-scm.com).
+# Install Google Chrome (needed because a LOCAL SYSTEM service can't reach
+# Playwright's per-user Chromium).
+node -v ; git --version      # verify both work
+```
+
+**2. Get the code**
+```powershell
+cd C:\   # or wherever you keep projects
+git clone <this-repo-url> wfm-live-scraper
+cd wfm-live-scraper
+npm install
+```
+
+**3. Create `.env`** (in the project root — it is gitignored, so it must be made
+per-machine). Fill in the real Supabase values:
+```
+HEADLESS=true
+CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
+SUPABASE_URL=<your-supabase-url>
+SUPABASE_KEY=<your-supabase-service-key>
+SCRAPE_INTERVAL_MS=30000
+```
+
+**4. Set `config.json`** — list ONLY the accounts this server should own, with
+their credentials. Make sure no other machine is running these same accounts
+(see Hard rule 1).
+
+**5. Install PM2 as a Windows Service** (so it runs at the lock screen, no login):
+```powershell
+git clone https://github.com/jessety/pm2-installer.git
+cd pm2-installer
+npm run configure
+npm run setup
+cd ..\wfm-live-scraper
+```
+
+**6. Start it and persist**
+```powershell
+pm2 start ecosystem.config.js
+pm2 save                       # records the process list for auto-resurrect
+```
+
+**7. Verify reboot-survival (the whole point):**
+Reboot the PC, leave it at the lock screen ~2 min, then log in and run:
+```powershell
+pm2 list                       # wfm-live-scraper should already be "online"
+pm2 logs wfm-live-scraper      # confirm each account logs in + scrapes
+```
+If it's `online` without you having started it, setup is correct — you can walk away.
+
+After this, day-to-day updates use `deploy.ps1` (see "Deploy / update workflow").
+
 ## Related project
 
 The dashboard that consumes this data is `../wfm-live-dashboard` (Next.js).
