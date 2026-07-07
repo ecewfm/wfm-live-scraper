@@ -12,10 +12,12 @@ module.exports = {
       name:         'wfm-live-scraper',
       script:       'scraper.js',
       watch:        false,
+      autorestart:  true,       // always bring it back
       restart_delay: 5000,      // wait 5s before restart on crash
-      max_restarts:  10,        // give up after 10 crashes in a row
+      max_restarts:  500,       // high cap for long unattended 24/7 runs
       env: {
-        NODE_ENV: 'production'
+        NODE_ENV: 'production',
+        HEADLESS: 'true'        // MUST be headless under a Windows Service (no desktop)
       }
     }
   ]
