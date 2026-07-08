@@ -425,6 +425,118 @@ function scrapeNiceDashboard(snapshotTime) {
   return results
 }
 
+// ── Keep-alive — ported from content_main.js (simulateUserActivity/idle guard)
+// and content_iframe.js (ClearView-specific mousemove/pointermove + "Dashboard
+// Paused" overlay auto-dismiss). Runs inside page.evaluate()/frame.evaluate();
+// self-contained, no outer scope. Installs the MutationObserver guard once
+// (idempotent via a window flag) and fires synthetic activity every call.
+function keepDashboardAlive() {
+  try {
+    var cx = Math.round((window.innerWidth || 800) / 2)
+    var cy = Math.round((window.innerHeight || 600) / 2)
+
+    // ClearView's OWN 20-min timer watches mousemove/pointermove specifically
+    // (confirmed by the "Move your cursor to resume updates" message).
+    var moveOpts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, screenX: cx, screenY: cy, movementX: 2, movementY: 0 }
+    document.dispatchEvent(new MouseEvent('mousemove', moveOpts))
+    document.dispatchEvent(new PointerEvent('pointermove', moveOpts))
+    if (document.body) {
+      document.body.dispatchEvent(new MouseEvent('mousemove', moveOpts))
+      document.body.dispatchEvent(new PointerEvent('pointermove', moveOpts))
+    }
+
+    // The main Angular idle service (session-level, separate timer) listens
+    // for pointerdown/pointerup/mousedown/keydown on document and
+    // keypress/keyup/click/scroll on window — NOT mousemove.
+    var clickOpts = { bubbles: false, cancelable: true, clientX: 1, clientY: 1 }
+    document.dispatchEvent(new PointerEvent('pointerdown', clickOpts))
+    document.dispatchEvent(new PointerEvent('pointerup', clickOpts))
+    document.dispatchEvent(new MouseEvent('mousedown', clickOpts))
+    var keyOpts = { bubbles: false, cancelable: true, key: 'Shift', code: 'ShiftLeft', shiftKey: true }
+    document.dispatchEvent(new KeyboardEvent('keydown', keyOpts))
+    window.dispatchEvent(new KeyboardEvent('keypress', keyOpts))
+    window.dispatchEvent(new KeyboardEvent('keyup', keyOpts))
+  } catch (e) { /* non-fatal */ }
+
+  function fireActivity() {
+    try {
+      var cx = Math.round((window.innerWidth || 800) / 2)
+      var cy = Math.round((window.innerHeight || 600) / 2)
+      var opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, screenX: cx, screenY: cy, movementX: 2, movementY: 0 }
+      document.dispatchEvent(new MouseEvent('mousemove', opts))
+      document.dispatchEvent(new PointerEvent('pointermove', opts))
+      if (document.body) {
+        document.body.dispatchEvent(new MouseEvent('mousemove', opts))
+        document.body.dispatchEvent(new PointerEvent('pointermove', opts))
+      }
+    } catch (e) {}
+  }
+
+  var PAUSE_RE = /dashboard.{0,10}paused|move your cursor.{0,30}resume|paused due to.{0,30}inactiv|still there|are you still|session.*expir|timed.?out/i
+
+  function dismissPausedNode(node) {
+    fireActivity()
+    setTimeout(fireActivity, 150)
+    setTimeout(fireActivity, 400)
+    setTimeout(function () {
+      try {
+        var closeSelectors = [
+          'button[aria-label*="close" i]', 'button[aria-label*="dismiss" i]',
+          '[class*="close"]', '[class*="dismiss"]', 'button.close',
+          '.modal-close', '[data-dismiss]',
+        ]
+        var clicked = false
+        for (var s = 0; s < closeSelectors.length; s++) {
+          var btn = node.querySelector(closeSelectors[s])
+          if (btn) { btn.click(); clicked = true; break }
+        }
+        if (!clicked) {
+          var btns = node.querySelectorAll('button, [role="button"], .btn')
+          for (var b = 0; b < btns.length; b++) {
+            if (/stay|yes|continue|ok|still here|keep|dismiss|resume|i.m here/i.test(btns[b].innerText || '')) { btns[b].click(); clicked = true; break }
+          }
+        }
+        if (!clicked && node.querySelector('button')) node.querySelector('button').click()
+      } catch (e) {}
+    }, 500)
+  }
+
+  // Immediate pass — catches a modal that's ALREADY on screen (a
+  // MutationObserver only sees future DOM changes, not the current state).
+  try {
+    if (document.body && PAUSE_RE.test(document.body.innerText || '')) {
+      var candidates = document.querySelectorAll('[class*="modal"], [class*="dialog"], [role="dialog"], [role="alertdialog"]')
+      var matched = false
+      for (var c = 0; c < candidates.length; c++) {
+        if (PAUSE_RE.test(candidates[c].innerText || candidates[c].textContent || '')) {
+          dismissPausedNode(candidates[c])
+          matched = true
+        }
+      }
+      if (!matched) dismissPausedNode(document.body)
+    }
+  } catch (e) {}
+
+  if (window.__hippoPauseGuardActive) return
+  window.__hippoPauseGuardActive = true
+
+  try {
+    var observer = new MutationObserver(function (mutations) {
+      for (var m = 0; m < mutations.length; m++) {
+        var added = mutations[m].addedNodes
+        for (var n = 0; n < added.length; n++) {
+          var node = added[n]
+          if (node.nodeType !== 1) continue
+          var text = node.innerText || node.textContent || ''
+          if (!PAUSE_RE.test(text)) continue
+          dismissPausedNode(node)
+        }
+      }
+    })
+    if (document.body) observer.observe(document.body, { childList: true, subtree: true })
+  } catch (e) {}
+}
+
 // ── Write to Supabase ─────────────────────────────────────────────────────────
 async function writeHippoData(datasets, accountId) {
   const now = new Date().toISOString()
@@ -512,6 +624,12 @@ module.exports = {
     try {
       const snapshotTime = new Date().toISOString()
       const frames = [page.mainFrame(), ...page.frames().filter(f => f !== page.mainFrame())]
+
+      // Simulate activity + install the "Dashboard Paused" auto-dismiss guard
+      // on every tick (every 30s — well under the 20-min ClearView timeout).
+      for (const frame of frames) {
+        try { await frame.evaluate(keepDashboardAlive) } catch (_) {}
+      }
 
       let datasets = []
       for (const frame of frames) {
