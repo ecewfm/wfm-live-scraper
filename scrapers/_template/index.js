@@ -14,28 +14,45 @@ module.exports = {
 
   // ── Metadata ────────────────────────────────────────────────────────────────
   meta: {
-    type:     'custom',   // Label shown in terminal dashboard (e.g. 'Aircall', 'Talkdesk')
-    interval: 30000,      // Scrape interval in ms. Remove to use global SCRAPE_INTERVAL_MS
+    type:        'custom',   // Label shown in terminal dashboard (e.g. 'Aircall', 'Talkdesk')
+    interval:    30000,      // Scrape interval in ms. Remove to use global SCRAPE_INTERVAL_MS
+
+    // DEFAULT: manualLogin = true. Most CRMs are hard to script login for
+    // (SSO, MFA, captchas, per-tenant login pages) — so by default this runner
+    // opens a VISIBLE browser at startup, navigates to the login page, and then
+    // WAITS. It does not touch the tick loop until you log in by hand in that
+    // window and run `resume <account-id>` in the scraper.js terminal.
+    //
+    // Only set this to false once you've written a real fill/submit flow below
+    // AND verified it works unattended (see perfectserve/uniters/7cs-live for
+    // examples of fully-automated login) — false means the runner assumes
+    // login() logs in for real, every time, with no human involved.
+    manualLogin: true,
   },
 
   // ── Login ───────────────────────────────────────────────────────────────────
   // Called once on startup (and again on session expiry / reload).
-  // Set up the browser, log in, and navigate to the live monitoring page.
   //
   // page:        Playwright Page object
   // context:     Playwright BrowserContext
-  // account:     { id, email, password, ...any extra fields from config.json }
-  // sessionPath: file path where cookies should be saved (for auto-login next run)
+  // account:     { id, ...any extra fields from config.json, e.g. dashboardUrl }
+  // sessionPath: file path where cookies get saved after a successful manual
+  //              login (via resume()) — reused next run so you don't have to
+  //              log in again as long as the session is still valid.
   //
+  // manualLogin mode (default): just navigate to the dashboard/login URL and
+  // return. Do NOT fill credentials — the human does that in the visible window.
   async login(page, context, account, sessionPath) {
-    // Example:
+    await page.goto(account.dashboardUrl || 'about:blank', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
+
+    // ── If you set manualLogin: false above, replace the line above with a
+    //    real automated flow instead, e.g.:
     // await page.goto('https://your-crm.com/login')
     // await page.fill('#email', account.email)
     // await page.fill('#password', account.password)
     // await page.click('button[type="submit"]')
     // await page.waitForURL('**/dashboard**', { timeout: 30000 })
     // await context.storageState({ path: sessionPath })
-    throw new Error('login() not implemented — edit scrapers/<account>/index.js')
   },
 
   // ── Scrape ──────────────────────────────────────────────────────────────────
@@ -80,13 +97,18 @@ module.exports = {
     console.log(`[${accountId}] write() not implemented`)
   },
 
-  // ── Optional: check if session expired ──────────────────────────────────────
-  // Return true if the current page indicates the session has expired.
-  // If omitted, the runner won't auto-detect session expiry.
+  // ── isSessionExpired — REQUIRED when manualLogin: true ───────────────────────
+  // This is how the runner decides whether to gate for manual login: called
+  // right after login() on init(), on every tick, and after reload(). Return
+  // true = not logged in (runner will pause + wait for `resume <id>`).
+  // If omitted while manualLogin is true, the runner assumes "always expired"
+  // and will gate on every single init/reload.
   //
-  // isSessionExpired(page) {
-  //   return page.url().includes('/login')
-  // },
+  // Adjust the URL pattern once you know what this CRM's login/SSO page looks
+  // like (e.g. 'login', 'signin', 'sso', 'okta', 'auth0' are common substrings).
+  isSessionExpired(page) {
+    return /login|signin|sso|auth0|okta/i.test(page.url())
+  },
 
   // ── Optional: custom display info ───────────────────────────────────────────
   // Return display values for the terminal dashboard.
