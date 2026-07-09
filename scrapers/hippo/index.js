@@ -115,7 +115,7 @@ function mapKnownWidgetRows(dataset, def, accountId, now) {
 // ── DOM scraping — ported from content_iframe.js + signalr_interceptor.js ───
 // Runs inside page.evaluate() / frame.evaluate(). Has no access to Node.js
 // scope — all helpers must be defined inline.
-function scrapeNiceDashboard(snapshotTime) {
+async function scrapeNiceDashboard(snapshotTime) {
   // ── Widget name extractor — strips live timestamps and counters ───────────
   function getWidgetName(element, fallbackIdx) {
     var ctx = element.closest(
@@ -152,23 +152,12 @@ function scrapeNiceDashboard(snapshotTime) {
     return 'Widget_Table_' + (fallbackIdx + 1)
   }
 
-  // ── Ag-Grid scraper ────────────────────────────────────────────────────────
-  function scrapeAgGrid(grid, name) {
-    var headers = []
-    var rows = []
-
-    grid.querySelectorAll('.ag-header-cell-text').forEach(function (cell) {
-      headers.push((cell.innerText && cell.innerText.trim()) || '')
-    })
-    if (headers.length === 0 || headers.every(function (h) { return h === '' })) {
-      headers = []
-      grid.querySelectorAll('.ag-header-cell').forEach(function (cell) {
-        var colId = cell.getAttribute('col-id') || ''
-        var text = (cell.innerText && cell.innerText.trim()) || colId
-        if (text) headers.push(text)
-      })
-    }
-
+  // ── Collect currently-visible ag-Grid rows (one static DOM pass) ───────────
+  // Keyed by ag-Grid's own row-index attribute where available (stable across
+  // our own scroll passes below, since we don't re-sort/filter mid-collection)
+  // so the same logical row scrolled into view twice doesn't get duplicated.
+  function collectVisibleAgGridRows(grid) {
+    var out = []
     grid.querySelectorAll('.ag-row:not(.ag-hidden)').forEach(function (row) {
       var cells = row.querySelectorAll('.ag-cell')
       if (cells.length === 0) return
@@ -189,8 +178,70 @@ function scrapeNiceDashboard(snapshotTime) {
         }
         rowData.push(text)
       })
-      if (rowData.slice(1).some(function (v) { return v !== '' })) rows.push(rowData)
+      if (!rowData.slice(1).some(function (v) { return v !== '' })) return
+      var rowIndex = row.getAttribute('row-index')
+      var key = rowIndex !== null ? 'idx:' + rowIndex : 'val:' + rowData.slice(1).join('|')
+      out.push({ key: key, data: rowData })
     })
+    return out
+  }
+
+  // ── Scroll ag-Grid's own viewport through its full range, merging rows as
+  // they come into view. ag-Grid virtualizes rows — only what's currently
+  // scrolled into view exists in the DOM — so a single static pass silently
+  // misses/keeps-stale any agent scrolled out of view at the moment of that
+  // scrape tick. Confirmed on ZenBusiness's identical setup; ported the fix
+  // here too since the risk is the same.
+  async function scrollAndCollectAgGridRows(grid) {
+    function sleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms) }) }
+    var viewport = grid.querySelector('.ag-body-viewport') || grid.querySelector('.ag-center-cols-viewport')
+    var rowMap = new Map()
+
+    function addCurrent() {
+      collectVisibleAgGridRows(grid).forEach(function (r) { rowMap.set(r.key, r.data) })
+    }
+
+    if (!viewport) { addCurrent(); return Array.from(rowMap.values()) }
+
+    var savedTop = viewport.scrollTop
+    viewport.scrollTop = 0
+    await sleep(80)
+    addCurrent()
+
+    var stepSize = Math.max(viewport.clientHeight - 30, 30)
+    var lastTop = -1
+    var guard = 0
+    while (guard < 200) {
+      guard++
+      var atBottom = viewport.scrollTop >= viewport.scrollHeight - viewport.clientHeight - 2
+      if (atBottom) break
+      viewport.scrollTop += stepSize
+      await sleep(90)
+      addCurrent()
+      if (viewport.scrollTop === lastTop) break
+      lastTop = viewport.scrollTop
+    }
+    viewport.scrollTop = savedTop
+    return Array.from(rowMap.values())
+  }
+
+  // ── Ag-Grid scraper ────────────────────────────────────────────────────────
+  async function scrapeAgGrid(grid, name) {
+    var headers = []
+
+    grid.querySelectorAll('.ag-header-cell-text').forEach(function (cell) {
+      headers.push((cell.innerText && cell.innerText.trim()) || '')
+    })
+    if (headers.length === 0 || headers.every(function (h) { return h === '' })) {
+      headers = []
+      grid.querySelectorAll('.ag-header-cell').forEach(function (cell) {
+        var colId = cell.getAttribute('col-id') || ''
+        var text = (cell.innerText && cell.innerText.trim()) || colId
+        if (text) headers.push(text)
+      })
+    }
+
+    var rows = await scrollAndCollectAgGridRows(grid)
 
     if (rows.length === 0) return null
     return { name: name, headers: ['Snapshot Time'].concat(headers), rows: rows }
@@ -222,19 +273,20 @@ function scrapeNiceDashboard(snapshotTime) {
   }
 
   // ── All tables (ag-Grid + plain HTML) ──────────────────────────────────────
-  function scrapeAllTables() {
+  async function scrapeAllTables() {
     var results = []
     var seenGrids = []
     var seenTables = []
 
-    document.querySelectorAll('.ag-root-wrapper').forEach(function (grid) {
-      if (grid.parentElement && grid.parentElement.closest('.ag-root-wrapper')) return
-      if (seenGrids.indexOf(grid) !== -1) return
+    var gridCandidates = Array.from(document.querySelectorAll('.ag-root-wrapper'))
+      .filter(function (grid) { return !(grid.parentElement && grid.parentElement.closest('.ag-root-wrapper')) })
+    for (var g = 0; g < gridCandidates.length; g++) {
+      var grid = gridCandidates[g]
       seenGrids.push(grid)
       var widgetName = getWidgetName(grid, seenGrids.length - 1)
-      var result = scrapeAgGrid(grid, widgetName)
+      var result = await scrapeAgGrid(grid, widgetName)
       if (result && result.rows.length > 0) results.push(result)
-    })
+    }
 
     document.querySelectorAll('table').forEach(function (tbl) {
       if (tbl.closest('.ag-root-wrapper')) return
@@ -406,7 +458,7 @@ function scrapeNiceDashboard(snapshotTime) {
   }
 
   // ── Assemble: tables + tiles, merging Angular SLA data into KPI_Tiles ───────
-  var results = scrapeAllTables()
+  var results = await scrapeAllTables()
   var tiles = scrapeTiles()
   var slaResults = scrapeAngularSlaWidgets()
 
@@ -569,8 +621,17 @@ async function writeHippoData(datasets, accountId) {
     if (!def) { genericDatasets.push(d); continue }
     const rows = mapKnownWidgetRows(d, def, accountId, now)
     if (rows.length > 0) {
-      await supabaseUpsert(def.table, rows)
-      console.log(`[hippo] ✅ ${d.name} → ${def.table} (${rows.length} row(s))`)
+      // Postgres rejects the whole upsert batch if the same id appears twice
+      // in it — dedup (last one wins) so one bad/duplicate row can't take
+      // down the entire write.
+      const dedupMap = new Map()
+      rows.forEach(r => dedupMap.set(r.id, r))
+      const dedupedRows = [...dedupMap.values()]
+      if (dedupedRows.length < rows.length) {
+        console.warn(`[hippo] ⚠ Dropped ${rows.length - dedupedRows.length} duplicate-id row(s) before writing ${def.table}`)
+      }
+      await supabaseUpsert(def.table, dedupedRows)
+      console.log(`[hippo] ✅ ${d.name} → ${def.table} (${dedupedRows.length} row(s))`)
     }
   }
 
@@ -580,8 +641,10 @@ async function writeHippoData(datasets, accountId) {
       id:           `${accountId}:${d.name}`,
       account_id:   accountId,
       dataset_name: d.name,
-      headers:      JSON.stringify(d.headers),
-      rows:         JSON.stringify(d.rows),
+      // Native jsonb arrays, not pre-stringified — supabaseUpsert's own
+      // JSON.stringify(payload) is the only serialization step needed here.
+      headers:      d.headers,
+      rows:         d.rows,
       row_count:    d.rows.length,
       updated_at:   now,
     }))
