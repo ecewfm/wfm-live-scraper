@@ -356,6 +356,11 @@ async function scrapeFrame(frame, accountId) {
             if (!nameEl) continue
             const agentName = txt(nameEl).trim()
             if (!agentName || agentName.length < 2) continue
+            // Some rows render a phone number/queue-extension link (e.g. "+1000")
+            // before the actual agent-name link, so querySelector('a') grabs the
+            // wrong anchor — same failure mode the fallback text-parser below
+            // already guards against (!/^\+\d+$/.test(ln)); apply it here too.
+            if (/^\+\d+$/.test(agentName)) continue
             if (allRowData.some(r => r.name === agentName)) continue  // dedupe
 
             // ── Status: <P> with co-text class ────────────────────────────

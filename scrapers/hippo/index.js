@@ -56,13 +56,35 @@ async function supabaseUpsert(table, rows) {
 // ── Departure detection — delete rows for agents no longer in the roster ─────
 // Upsert alone never removes a row, so an agent who logs out with no visible
 // "Offline"/"Logged Out" state to fall into would be left frozen in Supabase
-// forever. Tracks the ID set written last tick per table in memory; anything
-// missing this tick gets deleted. First tick after a process restart has no
-// baseline, so it never deletes anyone — only real future departures do.
+// forever. Tracks the ID set written last tick per table in memory. The FIRST
+// time a table is touched in this process's lifetime, the baseline is seeded
+// from Supabase's EXISTING rows for that account instead of an empty set —
+// otherwise a row already stale BEFORE this process started would never
+// enter tracking and never be recognized as departed. No deletion happens on
+// that seeding call itself, since an incomplete first live scrape could
+// otherwise look like a mass departure — only ticks after the seed delete.
 const _lastSeenIds = new Map() // table -> Set<id>
 
-async function pruneDeparted(table, currentIds) {
-  const prevIds = _lastSeenIds.get(table) || new Set()
+async function fetchExistingIds(table, accountId) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?account_id=eq.${encodeURIComponent(accountId)}&select=id`, {
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    })
+    if (!res.ok) return new Set()
+    const rows = await res.json()
+    return new Set(rows.map(r => r.id))
+  } catch (e) {
+    return new Set()
+  }
+}
+
+async function pruneDeparted(table, accountId, currentIds) {
+  if (!_lastSeenIds.has(table)) {
+    const existing = await fetchExistingIds(table, accountId)
+    _lastSeenIds.set(table, existing)
+    return
+  }
+  const prevIds = _lastSeenIds.get(table)
   const departed = [...prevIds].filter(id => !currentIds.has(id))
   if (departed.length > 0) {
     const filterValue = `(${departed.map(id => `"${String(id).replace(/"/g, '\\"')}"`).join(',')})`
@@ -656,7 +678,7 @@ async function writeHippoData(datasets, accountId) {
     if (dedupedRows.length < rows.length) {
       console.warn(`[hippo] ⚠ Dropped ${rows.length - dedupedRows.length} duplicate-id row(s) before writing ${def.table}`)
     }
-    await pruneDeparted(def.table, new Set(dedupedRows.map(r => r.id)))
+    await pruneDeparted(def.table, accountId, new Set(dedupedRows.map(r => r.id)))
     if (dedupedRows.length > 0) {
       await supabaseUpsert(def.table, dedupedRows)
       console.log(`[hippo] ✅ ${d.name} → ${def.table} (${dedupedRows.length} row(s))`)
