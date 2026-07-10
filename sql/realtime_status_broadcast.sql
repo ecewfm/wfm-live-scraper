@@ -22,6 +22,14 @@
 -- aren't wired into dashboard Realtime at all today (they rely on the 60s
 -- poll), so they don't need this trigger yet — add it the same way if that
 -- ever changes.
+--
+-- ALSO handles DELETE: each scraper now prunes (deletes) any agent row that
+-- vanished from the source CRM's own roster entirely — no "Offline" state to
+-- fall into, they're just gone (see the pruneDeparted() helper added to
+-- lib/db.js, lib/db-talkdesk.js, and scrapers/perfectserve|uniters|hippo|
+-- zenbusiness|edenhealth/index.js). Without a DELETE case here, that removal
+-- wouldn't be broadcast at all — the dashboard would only notice on its next
+-- 60s poll instead of instantly.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- ── Generic trigger function ──────────────────────────────────────────────────
@@ -29,7 +37,8 @@
 -- "status" column is named differently per table (status vs state):
 --   TG_ARGV[0] = status column name
 --   TG_ARGV[1] = agent name column name
--- Every one of these tables has account_id, so that's referenced directly.
+-- Every one of these tables has account_id, so that's referenced directly
+-- (via NEW on insert/update, via OLD on delete — NEW doesn't exist there).
 CREATE OR REPLACE FUNCTION public.notify_agent_status_change()
 RETURNS trigger
 SECURITY DEFINER SET search_path = ''
@@ -40,52 +49,62 @@ DECLARE
   old_status  text;
   new_status  text;
   agent_name  text;
+  acct_id     text;
 BEGIN
-  new_status := (to_jsonb(NEW) ->> status_col);
-  agent_name := (to_jsonb(NEW) ->> name_col);
-
-  IF TG_OP = 'UPDATE' THEN
+  IF TG_OP = 'DELETE' THEN
     old_status := (to_jsonb(OLD) ->> status_col);
-    IF old_status IS NOT DISTINCT FROM new_status THEN
-      RETURN NEW; -- status unchanged this tick — nothing worth broadcasting
+    agent_name := (to_jsonb(OLD) ->> name_col);
+    acct_id    := OLD.account_id;
+    new_status := NULL;
+  ELSE
+    new_status := (to_jsonb(NEW) ->> status_col);
+    agent_name := (to_jsonb(NEW) ->> name_col);
+    acct_id    := NEW.account_id;
+
+    IF TG_OP = 'UPDATE' THEN
+      old_status := (to_jsonb(OLD) ->> status_col);
+      IF old_status IS NOT DISTINCT FROM new_status THEN
+        RETURN NEW; -- status unchanged this tick — nothing worth broadcasting
+      END IF;
     END IF;
+    -- TG_OP = 'INSERT' (new agent row) always broadcasts — old_status stays NULL.
   END IF;
-  -- TG_OP = 'INSERT' (new agent row) always broadcasts — old_status stays NULL.
 
   PERFORM realtime.send(
     jsonb_build_object(
       'table',      TG_TABLE_NAME,
-      'account_id', NEW.account_id,
+      'account_id', acct_id,
       'agent_name', agent_name,
       'old_status', old_status,
-      'new_status', new_status
+      'new_status', new_status,
+      'departed',   (TG_OP = 'DELETE')
     ),
     'status_change',              -- event name — matches Dashboard.tsx's .on('broadcast', { event: 'status_change' }, ...)
     'wfm-realtime',                -- topic — matches the dashboard's single 'wfm-realtime' channel
     false                          -- public channel, no Realtime Authorization needed (same posture as postgres_changes today)
   );
 
-  RETURN NEW;
+  RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
 -- ── Triggers — one per table, passing that table's actual column names ───────
 DROP TRIGGER IF EXISTS trg_notify_status_change ON wfm_agent_states;
 CREATE TRIGGER trg_notify_status_change
-AFTER INSERT OR UPDATE ON wfm_agent_states
+AFTER INSERT OR UPDATE OR DELETE ON wfm_agent_states
 FOR EACH ROW EXECUTE FUNCTION notify_agent_status_change('status', 'agent_name');
 
 DROP TRIGGER IF EXISTS trg_notify_status_change ON talkdesk_agent_states;
 CREATE TRIGGER trg_notify_status_change
-AFTER INSERT OR UPDATE ON talkdesk_agent_states
+AFTER INSERT OR UPDATE OR DELETE ON talkdesk_agent_states
 FOR EACH ROW EXECUTE FUNCTION notify_agent_status_change('status', 'agent_name');
 
 DROP TRIGGER IF EXISTS trg_notify_status_change ON five9_agent_states;
 CREATE TRIGGER trg_notify_status_change
-AFTER INSERT OR UPDATE ON five9_agent_states
+AFTER INSERT OR UPDATE OR DELETE ON five9_agent_states
 FOR EACH ROW EXECUTE FUNCTION notify_agent_status_change('state', 'name');
 
 DROP TRIGGER IF EXISTS trg_notify_status_change ON uniters_agent_states;
 CREATE TRIGGER trg_notify_status_change
-AFTER INSERT OR UPDATE ON uniters_agent_states
+AFTER INSERT OR UPDATE OR DELETE ON uniters_agent_states
 FOR EACH ROW EXECUTE FUNCTION notify_agent_status_change('state', 'name');

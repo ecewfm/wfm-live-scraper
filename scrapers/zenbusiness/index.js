@@ -61,6 +61,33 @@ async function supabaseUpsert(table, rows) {
   }
 }
 
+// ── Departure detection — delete rows for agents no longer in the roster ─────
+// Upsert alone never removes a row, so an agent who logs out with no visible
+// "Offline"/"Logged Out" state to fall into would be left frozen in Supabase
+// forever. Tracks the ID set written last tick per table in memory; anything
+// missing this tick gets deleted. First tick after a process restart has no
+// baseline, so it never deletes anyone — only real future departures do.
+const _lastSeenIds = new Map() // table -> Set<id>
+
+async function pruneDeparted(table, currentIds) {
+  const prevIds = _lastSeenIds.get(table) || new Set()
+  const departed = [...prevIds].filter(id => !currentIds.has(id))
+  if (departed.length > 0) {
+    const filterValue = `(${departed.map(id => `"${String(id).replace(/"/g, '\\"')}"`).join(',')})`
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=in.${encodeURIComponent(filterValue)}`, {
+      method: 'DELETE',
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      console.warn(`[prune] delete failed for ${table}: ${res.status} ${text.substring(0, 120)}`)
+    } else {
+      console.log(`[prune] ${table}: removed ${departed.length} departed agent(s)`)
+    }
+  }
+  _lastSeenIds.set(table, currentIds)
+}
+
 function sanitizeKey(s) {
   return String(s || '').replace(/\s+/g, '_').toLowerCase().replace(/[^a-z0-9_]/g, '')
 }
@@ -523,7 +550,6 @@ async function writeZenBusinessData(datasets, accountId) {
     const def = KNOWN_AGENT_WIDGETS[d.name.trim().toLowerCase()]
     if (!def) { genericDatasets.push(d); continue }
     const rows = mapKnownWidgetRows(d, def, accountId, now)
-    if (rows.length === 0) continue
 
     // Postgres rejects a whole upsert batch if the same id appears twice in
     // it ("ON CONFLICT DO UPDATE command cannot affect row a second time") —
@@ -536,8 +562,11 @@ async function writeZenBusinessData(datasets, accountId) {
     if (dedupedRows.length < rows.length) {
       console.warn(`[zenbusiness] ⚠ Dropped ${rows.length - dedupedRows.length} duplicate-id row(s) before writing ${def.table}`)
     }
-    await supabaseUpsert(def.table, dedupedRows)
-    console.log(`[zenbusiness] ✅ ${d.name} → ${def.table} (${dedupedRows.length} row(s))`)
+    await pruneDeparted(def.table, new Set(dedupedRows.map(r => r.id)))
+    if (dedupedRows.length > 0) {
+      await supabaseUpsert(def.table, dedupedRows)
+      console.log(`[zenbusiness] ✅ ${d.name} → ${def.table} (${dedupedRows.length} row(s))`)
+    }
   }
 
   // ── Everything else → generic JSONB bucket (unknown/future widgets) ────────

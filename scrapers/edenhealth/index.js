@@ -71,6 +71,33 @@ function dedupeById(rows) {
   return [...map.values()]
 }
 
+// ── Departure detection — delete rows for agents no longer in the roster ─────
+// Upsert alone never removes a row, so an agent who logs out with no visible
+// "Offline" status to fall into would be left frozen in Supabase forever.
+// Tracks the ID set written last tick in memory; anything missing this tick
+// gets deleted. First tick after a process restart has no baseline, so it
+// never deletes anyone — only real future departures do.
+const _lastSeenIds = new Map() // table -> Set<id>
+
+async function pruneDeparted(table, currentIds) {
+  const prevIds = _lastSeenIds.get(table) || new Set()
+  const departed = [...prevIds].filter(id => !currentIds.has(id))
+  if (departed.length > 0) {
+    const filterValue = `(${departed.map(id => `"${String(id).replace(/"/g, '\\"')}"`).join(',')})`
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=in.${encodeURIComponent(filterValue)}`, {
+      method: 'DELETE',
+      headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+    })
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      console.warn(`[prune] delete failed for ${table}: ${res.status} ${text.substring(0, 120)}`)
+    } else {
+      console.log(`[prune] ${table}: removed ${departed.length} departed agent(s)`)
+    }
+  }
+  _lastSeenIds.set(table, currentIds)
+}
+
 // ── Second-page (Explore KPI tab) cache — one Page per account, reused across
 // ticks instead of reopened every time. Keyed by account.id in case this
 // module is ever reused by more than one account.
@@ -320,7 +347,9 @@ async function writeEdenHealthData(data, accountId) {
       status_duration:    a.statusDuration,
       updated_at:         now,
     }))
-    await supabaseUpsert('edenhealth_agents', dedupeById(agentRows))
+    const dedupedAgentRows = dedupeById(agentRows)
+    await pruneDeparted('edenhealth_agents', new Set(dedupedAgentRows.map(r => r.id)))
+    await supabaseUpsert('edenhealth_agents', dedupedAgentRows)
     console.log(`[edenhealth] ✅ Agents written (${agentRows.length})`)
   }
 }
