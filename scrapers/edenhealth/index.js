@@ -16,10 +16,16 @@
 // second page is cached per-account in EXPLORE_PAGES so we don't reopen it
 // every tick.
 //
-// LOGIN: plain email + password, no MFA/SSO (confirmed against the reference
-// extension's autologin.js, which only fills email/password and submits —
-// no OTP handling). So this account is fully automated (manualLogin: false),
-// unlike Hippo/ZenBusiness.
+// LOGIN: manualLogin (see meta below). Zendesk added MFA/2FA to this account
+// after this scraper was first written — auto-filling email/password now only
+// gets as far as the 2FA challenge, and the old auto-retry-on-expiry logic
+// repeatedly resubmitting credentials against that wall is what was getting
+// the account logged out/flagged in the first place. So, same pattern as
+// Hippo/ZenBusiness: open a VISIBLE browser, navigate to the dashboard URL,
+// and WAIT. Log in + complete MFA by hand, then in the scraper.js terminal run:
+//     resume edenhealth
+// The session is then persisted (sessions/edenhealth.json) so future restarts
+// skip the manual step as long as that session is still valid.
 //
 // config.json entry:
 //   {
@@ -147,19 +153,6 @@ async function ensureExplorePage(context, account) {
 // ── URL helpers ──────────────────────────────────────────────────────────────
 function isLoginUrl(url) {
   return /\/auth\/v3\/signin/.test(url || '')
-}
-
-// ── Login form fill — ported from autologin.js's doAutoLogin() ─────────────
-async function fillLoginForm(page, email, password) {
-  const emailInput = await page.waitForSelector('input[type="email"]', { timeout: 15000 })
-  const passInput  = await page.waitForSelector('input[type="password"]', { timeout: 15000 })
-  await emailInput.fill(email)
-  await page.waitForTimeout(150)
-  await passInput.fill(password)
-  await page.waitForTimeout(300)
-  const submitBtn = await page.$('button[type="submit"]')
-  if (!submitBtn) throw new Error('Submit button not found on Zendesk login page')
-  await submitBtn.click()
 }
 
 // ── "By team" dropdown — ported from content.js's selectByTeam() ───────────
@@ -381,12 +374,13 @@ module.exports = {
   meta: {
     type:        'zendesk',
     interval:    30000,
-    manualLogin: false, // plain email/password, no MFA — fully automated
+    manualLogin: true,   // MFA/2FA now required — see lib/account-runner.js, waits for `resume edenhealth`
   },
 
-  // ── Login: navigate to the Agent Status page; fill credentials if bounced
-  // to the sign-in page. Also opens the Explore KPI tab (same context/session,
-  // so no separate auth needed) and selects the "By team" roster view once.
+  // ── Login: manual — navigate and wait for the human when the session is
+  // gone (2FA can't be scripted). When the persisted session is still valid,
+  // the page lands straight on the Agent Status app — do the normal one-time
+  // setup (force to Agent Status, select "By team", open the Explore tab).
   async login(page, context, account, sessionPath) {
     page.on('pageerror', err => console.warn(`[edenhealth page error] ${err.message}`))
 
@@ -395,10 +389,8 @@ module.exports = {
     })
 
     if (isLoginUrl(page.url())) {
-      console.log('[edenhealth] On login page — filling credentials...')
-      await fillLoginForm(page, account.email, account.password)
-      await page.waitForURL(u => !isLoginUrl(u.toString()), { timeout: 20000 }).catch(() => {})
-      await context.storageState({ path: sessionPath }).catch(() => {})
+      console.log('[edenhealth] On login page — manual login + MFA required. Waiting for human (resume edenhealth once done)...')
+      return
     }
 
     // Zendesk may land somewhere else post-login (e.g. agent/home) — force
@@ -425,6 +417,11 @@ module.exports = {
     if (isLoginUrl(page.url())) return { hasData: false }
 
     const snapshotTime = new Date().toISOString()
+
+    // Safety net: `resume edenhealth` (after a manual MFA login) goes straight
+    // to tick()/scrape() without re-running login()'s setup — re-check the
+    // "By team" selection here too. Idempotent/cheap (no-op once selected).
+    await selectByTeamIfNeeded(page).catch(() => {})
 
     let agents = []
     try {
