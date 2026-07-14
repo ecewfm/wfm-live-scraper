@@ -66,6 +66,15 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ## How resilience works (so you know what NOT to reinvent)
 
 - Session persisted after login via `context.storageState()` → reused next launch.
+  **Exception:** `manualLogin: true` accounts (hippo, zenbusiness, edenhealth, wyze —
+  all MFA/2FA-gated) use a real on-disk Chrome profile instead
+  (`sessions/<id>-profile/`, via `chromium.launchPersistentContext()` in
+  [lib/browser.js](lib/browser.js)). `storageState()` only snapshots cookies +
+  localStorage, never IndexedDB — and MFA "remember this device" trust tokens
+  commonly live there — so a plain snapshot looked untrusted again on every
+  restart. The persistent profile keeps the real trust duration Zendesk/NICE
+  actually grants. It's a folder, not a JSON file — back it up/gitignore it
+  as a directory (`sessions/*-profile/`).
 - Every 30s tick checks `isSessionExpired()` and auto re-logs-in.
 - 3 consecutive empty scrapes → forced re-login (revives stale Five9 widgets).
 - Browser crash → relaunch + re-init.
