@@ -75,8 +75,15 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
   restart. The persistent profile keeps the real trust duration Zendesk/NICE
   actually grants. It's a folder, not a JSON file — back it up/gitignore it
   as a directory (`sessions/*-profile/`).
-- Every 30s tick checks `isSessionExpired()` and auto re-logs-in.
-- 3 consecutive empty scrapes → forced re-login (revives stale Five9 widgets).
+- Every 30s tick checks `isSessionExpired()` and, for auto-login accounts, triggers recovery.
+- 3 consecutive empty scrapes → also triggers recovery (revives stale Five9 widgets).
+- Recovery (`AccountRunner._attemptRecovery()` in [lib/account-runner.js](lib/account-runner.js)):
+  retries `module.login()` up to 5 times, 3s apart, checking `isSessionExpired()` after
+  each attempt. If all 5 still look expired, forces a hard `page.reload()` (a plain
+  `goto()` to the same URL is a no-op on hash-routed SPAs like NICE CXone's
+  `.../#/dashboard/wrapper/dashboards` that are already "at" that URL) before trying
+  `login()` once more. A `_ticking` flag makes `tick()` a no-op while one is already
+  in flight, since recovery can now run long enough to overlap the next interval fire.
 - Browser crash → relaunch + re-init.
 - PM2 → restarts the whole process on crash and after reboot.
 - There is NO dedicated keep-alive heartbeat and NO leader-election/locking

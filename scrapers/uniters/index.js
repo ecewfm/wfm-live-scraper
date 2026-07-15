@@ -711,9 +711,20 @@ async function writeFive9Data(data, accountId) {
     name:               a.name           || '',
     username:           a.username       || '',
     email:              a.email          || '',
-    // dashboard reads `state` + `duration`; surface the live current state there
+    // Hive's own dashboard shows these as two DIFFERENT columns per agent —
+    // "State" (coarse bucket: On Call / Ready / Not Ready, hardcoded per
+    // widget above or read from the Agent State roster's own "State" column)
+    // vs "Current State" (the detailed reason, e.g. "Ready (Voice,
+    // Voicemail)", "Not Ready (Approved Project)"). This used to write the
+    // SAME value (a.currentState if present) into both DB columns, so
+    // current_state was always just a duplicate of state.
+    // `state` stays detailed on purpose: the WFM dashboard's agentStatusCol
+    // preset for Uniters points at this column, and any status-duration
+    // breach thresholds already configured for this account are keyed
+    // against these exact detailed reason strings — switching it to the
+    // coarse bucket would silently stop those thresholds from matching.
     state:              a.currentState   || a.state || '',
-    current_state:      a.currentState   || a.state || '',
+    current_state:      a.state          || a.currentState || '',
     duration:           a.stateTimer     || a.duration || '',
     state_since:        a.stateSince     || '',
     call_type:          a.callType       || '',
