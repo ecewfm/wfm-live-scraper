@@ -13,9 +13,39 @@ The WFM Live Dashboard (separate project) reads from that Supabase.
 - Per-account logic: `scrapers/<account-id>/index.js` (each exports `login/scrape/write/meta`)
 - Shared libs: `lib/account-runner.js` (lifecycle, tick loop, recovery),
   `lib/browser.js` (Playwright launch + Aircall login + session persistence),
-  `lib/db.js` / `lib/db-talkdesk.js` (Supabase writes), `lib/terminal-dash.js` (UI)
+  `lib/db.js` / `lib/db-talkdesk.js` (Supabase writes), `lib/terminal-dash.js` (UI),
+  `lib/breach-detector.js` + `lib/cliq-notifier.js` (Zoho Cliq breach alerts — see below)
 - Accounts today: `7cs-live` (Aircall), `ashley-phones` (Talkdesk),
   `perfectserve` + `uniters` (Five9 CRM)
+
+## Zoho Cliq breach notifications (lib/cliq-notifier.js)
+
+Migrated from an older Google Apps Script tool's Cliq integration — runs
+entirely in THIS process (no Vercel Cron, no separate hosting) so it stays
+free. Started once in `scraper.js`'s startup IIFE, independent of any single
+account's `AccountRunner`.
+
+- Every 60s, reads each account's `wfm_settings` row (same Supabase table the
+  Next.js dashboard writes/reads: `data_source`, `kpi_thresholds`,
+  `status_thresholds`, `cliq_channel`) and, for accounts with a channel
+  configured, fetches that account's live KPI/agent rows and runs
+  `lib/breach-detector.js` — a faithful, line-for-line port of the
+  dashboard's own `buildBreaches()`/`checkKpi` (see `../wfm-live-dashboard`'s
+  `components/Dashboard.tsx` / `lib/utils.ts` if these two ever need
+  reconciling after a dashboard change).
+- Per-account cooldown (`cliq_last_sent_at` column, default 5 min, configurable
+  via the dashboard's Settings → Cliq Alerts tab) and a 5-minute staleness
+  suppression (mirrors the dashboard's own "DATA NOT IN SYNC" overlay) both
+  apply — cooldown only advances on a **confirmed successful send**.
+- Auth: a Zoho "Server-based Application" OAuth client (same one registered
+  for this integration, `ZOHO_CLIQ_CLIENT_ID`/`ZOHO_CLIQ_CLIENT_SECRET` in
+  `.env`) plus a `ZOHO_CLIQ_REFRESH_TOKEN` obtained ONCE via the dashboard
+  app's `/api/zoho/authorize` → `/api/zoho/callback` routes (that one-time
+  step needs a public HTTPS redirect, which only the Vercel app can provide —
+  everything after that runs independently, right here). Missing/blank Zoho
+  env vars just disable the notifier silently; nothing else is affected.
+- Terminal command `cliqscan` forces an immediate scan (bypasses cooldown,
+  NOT the staleness check — same as the old tool's "Force Scan").
 
 ## How it runs in production (IMPORTANT)
 
@@ -66,24 +96,8 @@ powershell -ExecutionPolicy Bypass -File .\deploy.ps1
 ## How resilience works (so you know what NOT to reinvent)
 
 - Session persisted after login via `context.storageState()` → reused next launch.
-  **Exception:** `manualLogin: true` accounts (hippo, zenbusiness, edenhealth, wyze —
-  all MFA/2FA-gated) use a real on-disk Chrome profile instead
-  (`sessions/<id>-profile/`, via `chromium.launchPersistentContext()` in
-  [lib/browser.js](lib/browser.js)). `storageState()` only snapshots cookies +
-  localStorage, never IndexedDB — and MFA "remember this device" trust tokens
-  commonly live there — so a plain snapshot looked untrusted again on every
-  restart. The persistent profile keeps the real trust duration Zendesk/NICE
-  actually grants. It's a folder, not a JSON file — back it up/gitignore it
-  as a directory (`sessions/*-profile/`).
-- Every 30s tick checks `isSessionExpired()` and, for auto-login accounts, triggers recovery.
-- 3 consecutive empty scrapes → also triggers recovery (revives stale Five9 widgets).
-- Recovery (`AccountRunner._attemptRecovery()` in [lib/account-runner.js](lib/account-runner.js)):
-  retries `module.login()` up to 5 times, 3s apart, checking `isSessionExpired()` after
-  each attempt. If all 5 still look expired, forces a hard `page.reload()` (a plain
-  `goto()` to the same URL is a no-op on hash-routed SPAs like NICE CXone's
-  `.../#/dashboard/wrapper/dashboards` that are already "at" that URL) before trying
-  `login()` once more. A `_ticking` flag makes `tick()` a no-op while one is already
-  in flight, since recovery can now run long enough to overlap the next interval fire.
+- Every 30s tick checks `isSessionExpired()` and auto re-logs-in.
+- 3 consecutive empty scrapes → forced re-login (revives stale Five9 widgets).
 - Browser crash → relaunch + re-init.
 - PM2 → restarts the whole process on crash and after reboot.
 - There is NO dedicated keep-alive heartbeat and NO leader-election/locking
@@ -125,6 +139,9 @@ CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
 SUPABASE_URL=<your-supabase-url>
 SUPABASE_KEY=<your-supabase-service-key>
 SCRAPE_INTERVAL_MS=30000
+ZOHO_CLIQ_CLIENT_ID=<optional — only needed for Cliq breach alerts, see below>
+ZOHO_CLIQ_CLIENT_SECRET=<optional>
+ZOHO_CLIQ_REFRESH_TOKEN=<optional>
 ```
 
 **4. Set `config.json`** — list ONLY the accounts this server should own, with
