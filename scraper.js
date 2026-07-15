@@ -15,7 +15,6 @@
 //   show [name]      — restore browser window
 //   retry <name>     — immediately re-scrape
 //   status           — print KPI summary for all accounts
-//   cliqscan         — force an immediate Zoho Cliq breach scan (bypasses cooldown, not staleness)
 //   help             — list all commands
 
 require('dotenv').config()
@@ -25,7 +24,6 @@ const path = require('path')
 
 const TerminalDash   = require('./lib/terminal-dash')
 const AccountRunner  = require('./lib/account-runner')
-const CliqNotifier   = require('./lib/cliq-notifier')
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const CONFIG_PATH   = path.join(__dirname, 'config.json')
@@ -53,9 +51,6 @@ dash.init()
 
 // ── Active runners ────────────────────────────────────────────────────────────
 const runners = {}  // accountId → AccountRunner
-
-// ── Zoho Cliq breach notifier — independent of any single account, own interval ─
-const cliqNotifier = new CliqNotifier(dash)
 
 // ── Load scraper module (busts require cache on reload) ───────────────────────
 function loadScraperModule(accountId) {
@@ -253,13 +248,8 @@ function handleCommand(raw) {
       break
     }
 
-    case 'cliqscan':
-      dash.log(null, '▶ Forcing an immediate Cliq breach scan...')
-      cliqNotifier.forceScan().catch(e => dash.warn(null, `[cliq] force scan failed: ${e.message}`))
-      break
-
     case 'help': case '?':
-      dash.log(null, 'add | start | reload | pause | resume | remove | list | hide | show | retry | status | cliqscan | help')
+      dash.log(null, 'add | start | reload | pause | resume | remove | list | hide | show | retry | status | help')
       dash.log(null, `Active: ${Object.keys(runners).join(', ') || '(none)'}`)
       break
 
@@ -284,11 +274,6 @@ function handleCommand(raw) {
     }
   }
 
-  // Independent of any single account — starts its own interval, never blocks
-  // account startup above (and never blocks on it either, per-account errors
-  // are caught inside).
-  cliqNotifier.start()
-
   // stdin commands
   process.stdin.resume()
   process.stdin.setEncoding('utf8')
@@ -301,13 +286,12 @@ function handleCommand(raw) {
   })
 
   setTimeout(() => {
-    dash.log(null, 'Commands: add | start | reload | pause | resume | remove | list | hide | show | retry | status | cliqscan | help')
+    dash.log(null, 'Commands: add | start | reload | pause | resume | remove | list | hide | show | retry | status | help')
   }, 2000)
 
   // Graceful shutdown
   process.on('SIGINT', async () => {
     dash.log(null, 'Shutting down...')
-    cliqNotifier.stop()
     for (const runner of Object.values(runners)) {
       try { await runner.stop() } catch (_) {}
     }

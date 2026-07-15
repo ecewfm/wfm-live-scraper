@@ -13,39 +13,14 @@ The WFM Live Dashboard (separate project) reads from that Supabase.
 - Per-account logic: `scrapers/<account-id>/index.js` (each exports `login/scrape/write/meta`)
 - Shared libs: `lib/account-runner.js` (lifecycle, tick loop, recovery),
   `lib/browser.js` (Playwright launch + Aircall login + session persistence),
-  `lib/db.js` / `lib/db-talkdesk.js` (Supabase writes), `lib/terminal-dash.js` (UI),
-  `lib/breach-detector.js` + `lib/cliq-notifier.js` (Zoho Cliq breach alerts — see below)
+  `lib/db.js` / `lib/db-talkdesk.js` (Supabase writes), `lib/terminal-dash.js` (UI)
 - Accounts today: `7cs-live` (Aircall), `ashley-phones` (Talkdesk),
   `perfectserve` + `uniters` (Five9 CRM)
 
-## Zoho Cliq breach notifications (lib/cliq-notifier.js)
-
-Migrated from an older Google Apps Script tool's Cliq integration — runs
-entirely in THIS process (no Vercel Cron, no separate hosting) so it stays
-free. Started once in `scraper.js`'s startup IIFE, independent of any single
-account's `AccountRunner`.
-
-- Every 60s, reads each account's `wfm_settings` row (same Supabase table the
-  Next.js dashboard writes/reads: `data_source`, `kpi_thresholds`,
-  `status_thresholds`, `cliq_channel`) and, for accounts with a channel
-  configured, fetches that account's live KPI/agent rows and runs
-  `lib/breach-detector.js` — a faithful, line-for-line port of the
-  dashboard's own `buildBreaches()`/`checkKpi` (see `../wfm-live-dashboard`'s
-  `components/Dashboard.tsx` / `lib/utils.ts` if these two ever need
-  reconciling after a dashboard change).
-- Per-account cooldown (`cliq_last_sent_at` column, default 5 min, configurable
-  via the dashboard's Settings → Cliq Alerts tab) and a 5-minute staleness
-  suppression (mirrors the dashboard's own "DATA NOT IN SYNC" overlay) both
-  apply — cooldown only advances on a **confirmed successful send**.
-- Auth: a Zoho "Server-based Application" OAuth client (same one registered
-  for this integration, `ZOHO_CLIQ_CLIENT_ID`/`ZOHO_CLIQ_CLIENT_SECRET` in
-  `.env`) plus a `ZOHO_CLIQ_REFRESH_TOKEN` obtained ONCE via the dashboard
-  app's `/api/zoho/authorize` → `/api/zoho/callback` routes (that one-time
-  step needs a public HTTPS redirect, which only the Vercel app can provide —
-  everything after that runs independently, right here). Missing/blank Zoho
-  env vars just disable the notifier silently; nothing else is affected.
-- Terminal command `cliqscan` forces an immediate scan (bypasses cooldown,
-  NOT the staleness check — same as the old tool's "Force Scan").
+Note: Zoho Cliq breach notifications are NOT part of this project — that
+scan/send loop runs as a Vercel Cron job in `../wfm-live-dashboard` (the
+Next.js app), since that account is on Vercel Pro and can run a real 1-minute
+cron for free. Don't reintroduce a Cliq notifier here.
 
 ## How it runs in production (IMPORTANT)
 
@@ -139,9 +114,6 @@ CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
 SUPABASE_URL=<your-supabase-url>
 SUPABASE_KEY=<your-supabase-service-key>
 SCRAPE_INTERVAL_MS=30000
-ZOHO_CLIQ_CLIENT_ID=<optional — only needed for Cliq breach alerts, see below>
-ZOHO_CLIQ_CLIENT_SECRET=<optional>
-ZOHO_CLIQ_REFRESH_TOKEN=<optional>
 ```
 
 **4. Set `config.json`** — list ONLY the accounts this server should own, with
