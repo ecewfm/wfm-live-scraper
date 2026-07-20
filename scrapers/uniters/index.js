@@ -711,9 +711,11 @@ async function writeFive9Data(data, accountId) {
     name:               a.name           || '',
     username:           a.username       || '',
     email:              a.email          || '',
-    // dashboard reads `state` + `duration`; surface the live current state there
+    // dashboard reads `state` + `duration`; surface the live current state there.
+    // Hive's "State" is the coarse bucket (Ready/Not Ready/On Call), "Current
+    // State" is the detailed reason — keep them mapped to distinct columns.
     state:              a.currentState   || a.state || '',
-    current_state:      a.currentState   || a.state || '',
+    current_state:      a.state          || a.currentState || '',
     duration:           a.stateTimer     || a.duration || '',
     state_since:        a.stateSince     || '',
     call_type:          a.callType       || '',
