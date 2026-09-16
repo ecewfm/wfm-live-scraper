@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Hippo Dashboard Scraper (WFM Live)",
+  "version": "1.0.0",
+  "description": "Captures live KPI tiles from Hippo's NICE CXone Dashboard and writes snapshots straight into WFM Live's Supabase database. Runs from the logged-in user's own browser — no separate scraper login needed.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://na1.nice-incontact.com/*",
+    "https://*.nice-incontact.com/*",
+    "https://*.niceincontact.com/*",
+    "https://frycbdxuyvdcybsiwhpt.supabase.co/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://na1.nice-incontact.com/apps/*",
+        "https://*.nice-incontact.com/apps/*"
+      ],
+      "js": ["content_main.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "https://*.nice-incontact.com/*",
+        "https://*.niceincontact.com/*"
+      ],
+      "js": ["content_iframe.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Hippo Dashboard Scraper"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["nice_styles.css", "signalr_interceptor.js"],
+      "matches": [
+        "https://na1.nice-incontact.com/*",
+        "https://*.nice-incontact.com/*",
+        "https://*.niceincontact.com/*"
+      ]
+    }
+  ]
+}

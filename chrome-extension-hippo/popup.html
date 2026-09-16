@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Hippo Dashboard Scraper</title>
+<style>
+  body{width:260px;background:#0d1117;color:#e0e0e0;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;margin:0;padding:12px}
+  h2{color:#60a5fa;font-size:13px;margin:0 0 4px}
+  .sub{font-size:10px;color:#4b5563;margin-bottom:12px}
+  .section-label{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin:10px 0 5px;padding-top:8px;border-top:1px solid #1f2937}
+  button{width:100%;padding:9px;border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer;margin-bottom:7px;font-size:12px}
+  .start{background:linear-gradient(135deg,#1e3a8a,#3b82f6)}
+  .stop{background:linear-gradient(135deg,#991b1b,#ef4444)}
+  .snap{background:linear-gradient(135deg,#1e40af,#3b82f6)}
+  .note{font-size:10px;color:#6b7280;text-align:center;margin-top:6px;line-height:1.4}
+  .pill{display:inline-block;font-size:9px;padding:2px 6px;border-radius:10px;font-weight:700;margin-right:4px}
+  .pill-nice{background:#1e3a8a;color:#93c5fd}
+  .pill-kpi{background:#166534;color:#86efac}
+</style>
+</head>
+<body>
+<h2>📊 Hippo Dashboard Scraper</h2>
+<div class="sub">
+  <span class="pill pill-nice">CXone</span> Dashboard KPIs
+  <span class="pill pill-kpi">→</span> WFM Live (Supabase)
+</div>
+
+<div class="section-label">Controls (active Hippo tab)</div>
+<button class="start" id="btnStart">▶ Start Auto Sync</button>
+<button class="stop"  id="btnStop">⏹ Stop</button>
+<button class="snap"  id="btnSnap">📸 Manual Snapshot</button>
+
+<p class="note">
+  Open the overlay on:<br>
+  <b>na1.nice-incontact.com/apps/#/dashboard/…</b><br><br>
+  The overlay appears automatically when the dashboard loads, and writes
+  straight to WFM Live — no Drive folder or login step needed.
+</p>
+
+<script>
+function sendToNiceTab(type) {
+  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+    const tab = tabs[0];
+    if (tab && tab.url && tab.url.includes('nice-incontact.com')) {
+      chrome.tabs.sendMessage(tab.id, { type });
+      return;
+    }
+    chrome.tabs.query({ url: 'https://na1.nice-incontact.com/apps/*' }, all => {
+      if (all && all[0]) chrome.tabs.sendMessage(all[0].id, { type });
+    });
+  });
+}
+
+document.getElementById('btnStart').onclick = () => sendToNiceTab('NICE_START_AUTO');
+document.getElementById('btnStop').onclick  = () => sendToNiceTab('NICE_STOP_AUTO');
+document.getElementById('btnSnap').onclick  = () => sendToNiceTab('NICE_MANUAL_SNAP');
+</script>
+</body>
+</html>

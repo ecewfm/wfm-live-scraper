@@ -1,4 +1,6 @@
 node_modules/
 sessions/*.json
+sessions/*-profile/
 .env
 config.json
+settings.json

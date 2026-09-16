@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wyze Dashboard Scraper</title>
+<style>
+  body{width:260px;background:#0d1117;color:#e0e0e0;font-family:'Segoe UI',Arial,sans-serif;font-size:13px;margin:0;padding:12px}
+  h2{color:#60a5fa;font-size:13px;margin:0 0 4px}
+  .sub{font-size:10px;color:#4b5563;margin-bottom:12px}
+  .section-label{font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin:10px 0 5px;padding-top:8px;border-top:1px solid #1f2937}
+  button{width:100%;padding:9px;border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer;margin-bottom:7px;font-size:12px}
+  .start{background:linear-gradient(135deg,#1e3a8a,#3b82f6)}
+  .stop{background:linear-gradient(135deg,#991b1b,#ef4444)}
+  .snap{background:linear-gradient(135deg,#1e40af,#3b82f6)}
+  .note{font-size:10px;color:#6b7280;text-align:center;margin-top:6px;line-height:1.4}
+  .pill{display:inline-block;font-size:9px;padding:2px 6px;border-radius:10px;font-weight:700;margin-right:4px}
+  .pill-zd{background:#1e3a8a;color:#93c5fd}
+  .pill-kpi{background:#166534;color:#86efac}
+</style>
+</head>
+<body>
+<h2>📊 Wyze Dashboard Scraper</h2>
+<div class="sub">
+  <span class="pill pill-zd">Zendesk WFM</span> Roster / Chat Monitor
+  <span class="pill pill-kpi">→</span> WFM Live (Supabase)
+</div>
+
+<div class="section-label">Controls (active Wyze tab)</div>
+<button class="start" id="btnStart">▶ Start Auto Sync</button>
+<button class="stop"  id="btnStop">⏹ Stop</button>
+<button class="snap"  id="btnSnap">📸 Manual Snapshot</button>
+
+<p class="note">
+  Open the overlay on either:<br>
+  <b>wyzelabs.zendesk.com/wfm/v2/agent-status</b><br>
+  <b>wyzelabs.zendesk.com/chat/agent#monitor</b><br><br>
+  Each page runs its own overlay/auto-loop independently and writes straight
+  to WFM Live — no login step needed here, log in normally (MFA and all)
+  first.
+</p>
+
+<script>
+function sendToWyzeTab(type) {
+  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+    const tab = tabs[0];
+    if (tab && tab.url && tab.url.includes('wyzelabs.zendesk.com')) {
+      chrome.tabs.sendMessage(tab.id, { type });
+      return;
+    }
+    chrome.tabs.query({ url: 'https://wyzelabs.zendesk.com/*' }, all => {
+      if (all && all[0]) chrome.tabs.sendMessage(all[0].id, { type });
+    });
+  });
+}
+
+document.getElementById('btnStart').onclick = () => sendToWyzeTab('WYZE_START_AUTO');
+document.getElementById('btnStop').onclick  = () => sendToWyzeTab('WYZE_STOP_AUTO');
+document.getElementById('btnSnap').onclick  = () => sendToWyzeTab('WYZE_MANUAL_SNAP');
+</script>
+</body>
+</html>

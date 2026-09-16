@@ -6,6 +6,13 @@
 // Commands (type + Enter while running):
 //   add <name>       — create scrapers/<name>/ from template, add to config
 //   start <name>     — start a configured account (after editing its scraper file)
+//   force <name>     — start/take over a locked account immediately, bypassing
+//                       the other instance's stale-lock wait (use with care)
+//   autologin <name> [on|off] — per-account toggle for auto-login attempts,
+//                       for manualLogin accounts that support it (currently
+//                       edenhealth, wyze); off always falls back to manual
+//                       login. No on/off arg prints that account's current
+//                       state.
 //   reload <name>    — hot-reload that account's scraper file (no full restart)
 //   pause <name>     — pause scraping (browser stays alive, session kept)
 //   resume <name>    — resume a paused account
@@ -24,6 +31,8 @@ const path = require('path')
 
 const TerminalDash   = require('./lib/terminal-dash')
 const AccountRunner  = require('./lib/account-runner')
+const settings       = require('./lib/settings')
+const { BUILD, NOTE } = require('./lib/version')
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const CONFIG_PATH   = path.join(__dirname, 'config.json')
@@ -69,11 +78,11 @@ function loadScraperModule(accountId) {
 }
 
 // ── Start a single account ────────────────────────────────────────────────────
-async function startAccount(account) {
+async function startAccount(account, force = false) {
   const mod    = loadScraperModule(account.id)
   const runner = new AccountRunner(account, mod, dash)
   runners[account.id] = runner
-  await runner.init()
+  await runner.init(force)
   runner.start()
 }
 
@@ -118,7 +127,19 @@ function cmdAdd(name) {
 // ── Command: start <name> ─────────────────────────────────────────────────────
 async function cmdStart(name) {
   if (!name) { dash.log(null, 'Usage: start <account-name>'); return }
-  if (runners[name]?.timer) { dash.log(null, `"${name}" is already running — use reload to refresh`); return }
+
+  // A runner sitting in awaitingLogin/awaitingLock has no .timer (it's
+  // cleared while paused/on standby) — checking .timer alone let a second
+  // `start` silently open a SECOND browser window on the same profile,
+  // orphaning the first one. Any tracked runner at all means don't start
+  // another; guide the operator to the right follow-up command instead.
+  const existing = runners[name]
+  if (existing) {
+    if (existing.awaitingLogin) { dash.log(null, `"${name}" already has a browser open awaiting manual login — log in THERE, then run: resume ${name}`); return }
+    if (existing.awaitingLock)  { dash.log(null, `"${name}" is on standby (locked by another instance) — use: force ${name}`); return }
+    dash.log(null, `"${name}" is already running — use reload to refresh`)
+    return
+  }
 
   const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
   const account = config.find(a => a.id === name)
@@ -135,6 +156,44 @@ async function cmdStart(name) {
     await startAccount(account)
   } catch (err) {
     dash.error(name, `Failed to start: ${err.message}`)
+  }
+}
+
+// ── Command: force <name> ─────────────────────────────────────────────────────
+// Bypasses the distributed lock's STALE_MS wait — for when the operator
+// already knows the other holder is stale/gone (e.g. being decommissioned
+// account-by-account) and doesn't want to wait out the 90s heartbeat timeout.
+async function cmdForce(name) {
+  if (!name) { dash.log(null, 'Usage: force <account-name>'); return }
+
+  const existing = runners[name]
+  if (existing && existing.awaitingLock) {
+    dash.log(null, `▶ Force-taking "${name}" from the other instance...`)
+    await existing.forceTakeover()
+    return
+  }
+  // Same reasoning as cmdStart: any other tracked state (running, or stuck
+  // awaiting manual login) already has a browser open — force-starting on
+  // top of it would just open a second, orphaned one.
+  if (existing) {
+    if (existing.awaitingLogin) { dash.log(null, `"${name}" already has a browser open awaiting manual login — log in THERE, then run: resume ${name}`); return }
+    dash.log(null, `"${name}" is already running here`)
+    return
+  }
+
+  const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+  const account = config.find(a => a.id === name)
+  if (!account) {
+    dash.log(null, `"${name}" not in config.json — run: add ${name}`)
+    return
+  }
+  if (!dash.accounts.find(a => a.id === name)) dash.addAccount(name)
+
+  dash.log(null, `▶ Force-starting ${name}...`)
+  try {
+    await startAccount(account, true)
+  } catch (err) {
+    dash.error(name, `Failed to force-start: ${err.message}`)
   }
 }
 
@@ -175,11 +234,28 @@ function handleCommand(raw) {
   const parts = line.split(/\s+/)
   const cmd   = parts[0].toLowerCase()
   const arg   = parts[1]
+  const arg2  = parts[2]
 
   switch (cmd) {
     case 'add':    cmdAdd(arg);    break
     case 'start':  cmdStart(arg);  break
+    case 'force':  cmdForce(arg);  break
     case 'reload': cmdReload(arg); break
+
+    case 'autologin': {
+      const accountId = arg
+      const val = arg2?.toLowerCase()
+      if (!accountId) { dash.log(null, 'Usage: autologin <account> [on|off]'); break }
+      if (!ACCOUNTS.find(a => a.id === accountId)) { dash.log(null, `Unknown account: "${accountId}"`); break }
+      if (!val) {
+        dash.log(null, `Auto-login for "${accountId}" is currently ${settings.isAutoLoginEnabled(accountId) ? 'ON' : 'OFF'}`)
+        break
+      }
+      if (val === 'on')  { settings.setAutoLogin(accountId, true);  dash.log(null, `✅ Auto-login ON for "${accountId}"`) }
+      else if (val === 'off') { settings.setAutoLogin(accountId, false); dash.log(null, `⏸ Auto-login OFF for "${accountId}" — will always wait for manual login`) }
+      else dash.log(null, 'Usage: autologin <account> on|off')
+      break
+    }
 
     case 'pause': {
       const ids = arg ? [arg] : Object.keys(runners)
@@ -191,11 +267,18 @@ function handleCommand(raw) {
     }
 
     case 'resume': {
-      const ids = arg ? [arg] : Object.keys(runners)
-      ids.forEach(id => {
-        if (!runners[id]) { dash.log(null, `Unknown: ${id}`); return }
-        runners[id].resume()
-      })
+      // With an explicit id: an account that's never been started at all
+      // (the new default — see the startup message) has no runner yet, so
+      // fall back to starting it fresh instead of just saying "Unknown" —
+      // `start` and `resume` should both work to open an account's browser.
+      // Bare `resume` (no id) only resumes already-tracked runners; it
+      // deliberately does NOT start every configured account.
+      if (arg) {
+        if (!runners[arg]) { cmdStart(arg); break }
+        runners[arg].resume()
+        break
+      }
+      Object.keys(runners).forEach(id => runners[id].resume())
       break
     }
 
@@ -249,7 +332,7 @@ function handleCommand(raw) {
     }
 
     case 'help': case '?':
-      dash.log(null, 'add | start | reload | pause | resume | remove | list | hide | show | retry | status | help')
+      dash.log(null, 'add | start | force | autologin | reload | pause | resume | remove | list | hide | show | retry | status | help')
       dash.log(null, `Active: ${Object.keys(runners).join(', ') || '(none)'}`)
       break
 
@@ -260,19 +343,15 @@ function handleCommand(raw) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 ;(async () => {
-  // Start all accounts from config.json
-  for (const account of ACCOUNTS) {
-    const scraperPath = path.join(SCRAPERS_DIR, account.id, 'index.js')
-    if (!fs.existsSync(scraperPath)) {
-      dash.warn(account.id, `No scraper file — run: add ${account.id}  then: start ${account.id}`)
-      continue
-    }
-    try {
-      await startAccount(account)
-    } catch (err) {
-      dash.error(account.id, `Startup failed: ${err.message}`)
-    }
-  }
+  // Nothing auto-starts anymore — every account (headless or visible-browser)
+  // now waits for an explicit `start <id>` / `resume <id>` before it opens
+  // anything or hits its CRM. Each row still shows up in the dashboard above
+  // (via TerminalDash's constructor) as "not started" so it's clear what's
+  // available without needing to run `list` first.
+  dash.log(null, `Build ${BUILD} — ${NOTE}`)
+  dash.log(null, `${ACCOUNTS.length} account(s) configured, none started automatically.`)
+  dash.log(null, `Available: ${ACCOUNTS.map(a => a.id).join(', ')}`)
+  dash.log(null, `Run: start <id>  or  resume <id>  to open one.`)
 
   // stdin commands
   process.stdin.resume()
@@ -286,7 +365,7 @@ function handleCommand(raw) {
   })
 
   setTimeout(() => {
-    dash.log(null, 'Commands: add | start | reload | pause | resume | remove | list | hide | show | retry | status | help')
+    dash.log(null, 'Commands: add | start | force | autologin | reload | pause | resume | remove | list | hide | show | retry | status | help')
   }, 2000)
 
   // Graceful shutdown

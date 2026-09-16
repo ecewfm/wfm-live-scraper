@@ -44,6 +44,8 @@
 
 'use strict'
 
+const settings = require('../../lib/settings')
+
 // ── Supabase write helper (same pattern as hippo/zenbusiness) ──────────────
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_KEY
@@ -153,6 +155,54 @@ async function ensureExplorePage(context, account) {
 // ── URL helpers ──────────────────────────────────────────────────────────────
 function isLoginUrl(url) {
   return /\/auth\/v3\/signin/.test(url || '')
+}
+
+// ── Auto-login attempt — email+password only, MFA is never scripted ─────────
+// DOM-confirmed via a live probe: the signin page (tryeden.zendesk.com/auth/
+// v3/signin) is a plain React form — input[type="email"], input[type=
+// "password"], button[type="submit"] ("Sign in") — no separate identifier-
+// first step.
+//
+// Whether this actually gets us in depends on something we can't see from
+// the DOM: whether the persistent Chrome profile's "remember this device"
+// MFA trust is still valid even though the plain session cookie expired.
+//   - Trust still valid  → submitting these two fields is enough, Zendesk
+//     skips straight past MFA, we land on the real dashboard. Returns true.
+//   - Trust also expired → an MFA/2FA prompt appears instead (we don't need
+//     to know what that looks like) and we never reach the dashboard within
+//     the wait below. Returns false — caller falls back to the existing
+//     manual/`resume edenhealth` gate, same as before this existed.
+async function attemptAutoLogin(page, account) {
+  const tag = `[${account.id}]`
+  try {
+    const emailField = await page.waitForSelector('input[type="email"]', { timeout: 8000 }).catch(() => null)
+    const passwordField = await page.$('input[type="password"]')
+    if (!emailField || !passwordField) {
+      console.log(`${tag} Auto-login: email/password fields not found (SSO-only login page?) — skipping to manual.`)
+      return false
+    }
+
+    await emailField.fill(account.email)
+    await passwordField.fill(account.password)
+    await page.waitForTimeout(300)
+
+    const submitBtn = await page.$('button[type="submit"]')
+    if (!submitBtn) return false
+    await submitBtn.click()
+
+    // Either we navigate away from the signin URL (trust valid, logged in),
+    // or an MFA prompt renders in place / we're bounced back to signin
+    // (trust expired) and this just times out — both are handled the same
+    // way below by re-checking the URL directly rather than trusting the
+    // wait's own success/failure.
+    await page.waitForURL(url => !isLoginUrl(url.href), { timeout: 15000 }).catch(() => {})
+    await page.waitForTimeout(1000)
+
+    return !isLoginUrl(page.url())
+  } catch (e) {
+    console.warn(`${tag} Auto-login attempt failed: ${e.message}`)
+    return false
+  }
 }
 
 // ── "By team" dropdown — ported from content.js's selectByTeam() ───────────
@@ -377,9 +427,9 @@ module.exports = {
     manualLogin: true,   // MFA/2FA now required — see lib/account-runner.js, waits for `resume edenhealth`
   },
 
-  // ── Login: manual — navigate and wait for the human when the session is
-  // gone (2FA can't be scripted). When the persisted session is still valid,
-  // the page lands straight on the Agent Status app — do the normal one-time
+  // ── Login: try auto-login (email+password) first, fall back to manual +
+  // wait only if that doesn't get us past MFA. When the persisted session
+  // (or the auto-login attempt) lands us on the app, do the normal one-time
   // setup (force to Agent Status, select "By team", open the Explore tab).
   async login(page, context, account, sessionPath) {
     page.on('pageerror', err => console.warn(`[edenhealth page error] ${err.message}`))
@@ -388,9 +438,25 @@ module.exports = {
       console.warn(`[edenhealth] goto failed: ${e.message}`)
     })
 
+    // Zendesk's React app sometimes redirects to the signin page via
+    // client-side JS AFTER domcontentloaded already resolved above — checking
+    // page.url() immediately can still read the pre-redirect agent-status URL
+    // and skip auto-login entirely, leaving the page to land on signin on its
+    // own a moment later with nothing ever attempted. Give that redirect a
+    // beat to happen before deciding where we actually are.
+    await page.waitForURL(url => isLoginUrl(url.href), { timeout: 3000 }).catch(() => {})
+
     if (isLoginUrl(page.url())) {
-      console.log('[edenhealth] On login page — manual login + MFA required. Waiting for human (resume edenhealth once done)...')
-      return
+      if (!settings.isAutoLoginEnabled(account.id)) {
+        console.log(`[edenhealth] Auto-login is OFF for "${account.id}" (autologin ${account.id} off) — waiting for human (resume ${account.id} once done)...`)
+        return
+      }
+      const autoLoggedIn = await attemptAutoLogin(page, account)
+      if (!autoLoggedIn) {
+        console.log('[edenhealth] Auto-login did not reach the dashboard (likely an MFA prompt) — waiting for human (resume edenhealth once done)...')
+        return
+      }
+      console.log('[edenhealth] ✅ Auto-login succeeded — device still trusted, no MFA prompt this time')
     }
 
     // Zendesk may land somewhere else post-login (e.g. agent/home) — force

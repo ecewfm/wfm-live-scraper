@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Wyze Dashboard Scraper (WFM Live)",
+  "version": "1.0.0",
+  "description": "Captures live agent roster and chat monitor data from Wyze's Zendesk WFM app and writes snapshots straight into WFM Live's Supabase database. Runs from the logged-in user's own browser — no separate scraper login needed.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://wyzelabs.zendesk.com/*",
+    "https://frycbdxuyvdcybsiwhpt.supabase.co/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://wyzelabs.zendesk.com/wfm/v2/agent-status*"
+      ],
+      "js": ["overlay.js", "content_roster.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://wyzelabs.zendesk.com/chat/agent*"
+      ],
+      "js": ["overlay.js", "content_chat.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Wyze Dashboard Scraper"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["wyze_styles.css"],
+      "matches": ["https://wyzelabs.zendesk.com/*"]
+    }
+  ]
+}
