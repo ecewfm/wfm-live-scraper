@@ -51,9 +51,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 'use strict'
+const { isFatalPageError } = require('../../lib/scrape-errors')
 
 const SUPERVISOR_URL = 'https://app-atl.five9.com/'
-const LOGIN_TIMEOUT  = 90000   // 90s for full login flow
+// Five9 itself sometimes shows "Unable to load the application. Please retry
+// in a few minutes." on a slow/overloaded boot — confirmed live, unrelated to
+// credentials. handleFive9Login reloads and keeps waiting when it sees this,
+// so the overall timeout needs enough runway to survive a few such cycles
+// instead of giving up after a single one (90s wasn't enough headroom).
+const LOGIN_TIMEOUT  = 300000  // 5 minutes for full login flow
 const DASH_TIMEOUT   = 60000   // 60s to wait for dashboard widgets
 
 // ── Supabase write helper (same pattern as db-talkdesk.js) ───────────────────
@@ -150,6 +156,110 @@ async function waitForSel(page, selector, timeout = 10000) {
   } catch { return null }
 }
 
+// ── Detect a visible login-error message ─────────────────────────────────────
+// NEVER retry/resubmit credentials past this — repeatedly submitting bad
+// credentials risks a real account lockout on Five9's side. Called both
+// before filling the form (in case an error from a PRIOR submit this same
+// login() call is still showing) and after submitting (to catch the result
+// of THIS submit) — either way, handleFive9Login throws immediately instead
+// of looping back to try again.
+// Matching on [class*="error"] alone is too broad — Five9 wraps the whole
+// app in a persistent element with "error" in its class/id (an error-
+// boundary container) that's present on completely normal pages too, and
+// its textContent picks up unrelated boilerplate (e.g. the "Need help? /
+// Customer Support Team" footer, which is on the ordinary login page as
+// well). Require the matched text to actually look like a credential
+// rejection, not just live inside an "error"-named element.
+const KNOWN_LOGIN_ERROR_PHRASES = [
+  'invalid username', 'invalid password', 'incorrect password',
+  'authentication failed', 'login failed', 'account is locked',
+  'account locked', 'too many attempts', 'invalid credentials',
+]
+async function checkLoginError(page) {
+  return page.evaluate((phrases) => {
+    const els = Array.from(document.querySelectorAll('[class*="error" i], [id*="error" i]'))
+    for (const el of els) {
+      const r = el.getBoundingClientRect()
+      const txt = (el.textContent || '').trim()
+      if (r.width === 0 || r.height === 0 || !txt) continue
+      const lower = txt.toLowerCase()
+      if (phrases.some(p => lower.includes(p))) return txt
+    }
+    return null
+  }, KNOWN_LOGIN_ERROR_PHRASES)
+}
+
+// ── Five9's own "app failed to boot" screen ──────────────────────────────────
+// "Unable to load the application. Please retry in a few minutes." — a
+// generic availability hiccup on a slow/overloaded boot, confirmed live and
+// unrelated to credentials (it can appear before any login attempt at all).
+// Distinct from checkLoginError() on purpose: this should reload and keep
+// waiting, not stop the whole login() call.
+//
+// Exact markup confirmed via live DevTools inspection:
+//   <section id="fatal-error" class="show">
+//     <div class="fatal-error-top">
+//       <div>Unable to load the application. Please retry in a few minutes.</div>
+//       <a id="reload-button" href="javascript:window.location.reload()">Reload</a>
+//     </div>
+//     <div class="fatal-error-bottom">...</div>
+//   </section>
+// "show" is Five9's OWN toggle class for this exact fatal-error state — a
+// precise, purpose-built signal, unlike the earlier text/Reload-link
+// heuristics (which false-matched a hidden duplicate on the normal login
+// page). Still gate on real visibility too, matching this site's recurring
+// pattern of hidden-but-present elements.
+async function checkAppLoadFailure(page) {
+  return page.evaluate(() => {
+    const el = document.querySelector('#fatal-error')
+    if (!el || !el.classList.contains('show')) return null
+    const r = el.getBoundingClientRect()
+    if (r.width === 0 || r.height === 0) return null
+    const msg = el.querySelector('.fatal-error-top > div')
+    return (msg?.textContent || el.textContent || 'Five9 fatal-error page').trim().slice(0, 200)
+  })
+}
+
+// ── Wait out Five9's "please wait" blocking overlay after a login submit ────
+// (#Login-block-access / #Login-wait-logo-wrapper) — it can sit on top of the
+// SAME login form DOM for several seconds while the real submit is still
+// being processed. Without this, handleFive9Login sees #Login-username-input
+// still present, thinks the form needs (re)filling, and resubmits credentials
+// while the FIRST submission hasn't resolved yet — confirmed live: a real,
+// correct-password submit followed immediately by a second blind resubmit
+// attempt against the disabled button underneath this exact overlay.
+async function waitForLoginOverlayToClear(page, timeout = 20000) {
+  try {
+    await page.waitForFunction(() => {
+      const overlay = document.querySelector('#Login-block-access, #Login-wait-logo-wrapper')
+      if (!overlay) return true
+      const r = overlay.getBoundingClientRect()
+      return r.width === 0 || r.height === 0
+    }, { timeout })
+  } catch {
+    // Fall through — let the outer loop re-evaluate the page state rather
+    // than hang here indefinitely.
+  }
+}
+
+// ── Is the Station Setup screen ("Station Type: Softphone/WebRTC/.../None
+// + Next") currently showing? ─────────────────────────────────────────────
+// Confirmed via live DevTools inspection: <div id="StationSetupScreen">.
+// This SPA does NOT change the URL between Station Setup and the real
+// dashboard — both live at .../supervisor/index.html?role=DomainSupervisor —
+// so a plain "does the URL look like the dashboard" check can declare
+// success while Station Setup is still the actual thing on screen (confirmed
+// live: login() returned, but the saved screenshot showed Station Setup with
+// "Next" never clicked). Must gate the dashboard-URL check on this too.
+async function isStationSetupShowing(page) {
+  return page.evaluate(() => {
+    const el = document.querySelector('#StationSetupScreen')
+    if (!el) return false
+    const r = el.getBoundingClientRect()
+    return r.width > 0 && r.height > 0
+  })
+}
+
 // ── Full Five9 login flow — handles all states autologin.js handles ──────────
 // States encountered in order (not always all of them):
 //   1. Role selection cards → click Supervisor
@@ -172,10 +282,46 @@ async function handleFive9Login(page, account) {
     console.log(`[F9 login] pass=${pass} url=${url.substring(0, 80)}`)
 
     // ── Dashboard loaded? Check widgets OR supervisor URL ───────────────────
+    // MUST also confirm Station Setup isn't still showing — see
+    // isStationSetupShowing()'s comment: this exact URL is shared by both
+    // screens, so without this check login() can return "complete" while
+    // Station Setup (with an unclicked Next button) is what's actually on
+    // screen. AND: right after navigating here (e.g. from clicking the
+    // Supervisor role card), the URL updates before either screen has
+    // actually rendered — checking immediately can see neither yet. This
+    // MUST NOT default to "success" if nothing has rendered yet (confirmed
+    // live: an 8s wait wasn't enough under real load, and falling through to
+    // declare success anyway is exactly the bug this is fixing) — only
+    // decide once we've actually observed real content, otherwise just loop
+    // again on the next pass.
     if (url.includes('DomainSupervisor') || url.includes('/supervisor/index')) {
-      console.log('[F9 login] ✅ Supervisor URL reached — login complete')
-      return
+      const settled = await page.waitForFunction(() => {
+        return document.querySelector('#StationSetupScreen') ||
+               document.querySelector('.stat-view, .stat-threshold-container, .f9-widget-grid-row, .f9-panel-header-label')
+      }, { timeout: 25000 }).then(() => true).catch(() => false)
+
+      if (!settled) {
+        // Neither Station Setup nor real widgets rendered yet — don't guess.
+        await sleep(2000)
+        continue
+      }
+      if (!(await isStationSetupShowing(page))) {
+        console.log('[F9 login] ✅ Supervisor URL reached — login complete')
+        return
+      }
+      // else: Station Setup confirmed showing — fall through to the Station
+      // Setup handling block below (clicks None + Next).
     }
+
+    // ── Five9 app failed to boot — reload and keep waiting, not fatal ───────
+    const appLoadFailure = await checkAppLoadFailure(page)
+    if (appLoadFailure) {
+      console.log(`[F9 login] App failed to load ("${appLoadFailure}") — reloading and retrying...`)
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
+      await sleep(8000)
+      continue
+    }
+
     const widgets = await page.$$('.stat-view, .stat-threshold-container, .f9-widget-grid-row')
     if (widgets.length > 0) {
       console.log('[F9 login] ✅ Dashboard widgets found')
@@ -193,13 +339,21 @@ async function handleFive9Login(page, account) {
 
     // ── Role selection cards — click Supervisor ──────────────────────────────
     // ATL branded page shows AT&T-style role cards
+    // NOTE: this element can exist in the DOM (matched) while hidden by CSS
+    // — e.g. a leftover/pre-rendered role-select fragment sitting behind the
+    // actual login form on first load. A plain page.$() match isn't enough;
+    // Playwright's .click() would otherwise wait its full default timeout for
+    // a hidden element to become clickable and then throw, even though a
+    // later, real, visible state (the login form) is right there. Always gate
+    // on isVisible() before treating a match as actionable so a false match
+    // falls through to the next check instead of hanging the whole pass.
     const supCard = await page.$(
       'a.home-link.supervisor, ' +
       '[class*="role-card"] a[href*="supervisor"], ' +
       'a[href*="DomainSupervisor"], ' +
       '.at-t-applications__card'
     )
-    if (supCard) {
+    if (supCard && await supCard.isVisible()) {
       console.log('[F9 login] Role cards — clicking Supervisor...')
       await supCard.click()
       await sleep(3000)
@@ -211,6 +365,7 @@ async function handleFive9Login(page, account) {
     const atCards = await page.$$('.at-t-applications__card, [class*="five9-role"], [class*="roleCard"]')
     let clickedCard = false
     for (const card of atCards) {
+      if (!(await card.isVisible())) continue
       const txt = (await card.textContent() || '').toLowerCase()
       if (txt.includes('supervisor') && !txt.includes('agent')) {
         console.log('[F9 login] Clicking Supervisor card (AT&T branded)...')
@@ -224,28 +379,57 @@ async function handleFive9Login(page, account) {
 
     // ── Station setup — click None → Next ────────────────────────────────────
     const noneStation = await page.$('#station-setup-4')
-    if (noneStation) {
+    if (noneStation && await noneStation.isVisible()) {
       console.log('[F9 login] Station setup — clicking None...')
       const isActive = await noneStation.evaluate(el => el.classList.contains('active'))
       if (!isActive) {
         await noneStation.click()
         await sleep(500)
       }
-      const nextBtn = await page.$('.btn.pull-right.f9-positive-cta-btn, .f9-positive-cta-btn')
-      if (nextBtn) {
+      // Scoped to #StationSetupFooter (confirmed via live DevTools
+      // inspection) — the bare .f9-positive-cta-btn class is reused all over
+      // Five9 (e.g. the Existing Session modal's own Force button carries
+      // the exact same three classes: btn pull-right f9-positive-cta-btn), so
+      // an unscoped page.$() can resolve to a hidden, unrelated element
+      // elsewhere in the DOM and silently never click the real, visible Next
+      // button here — confirmed live as the cause of getting stuck on this
+      // screen despite None already being selected.
+      const nextBtn = await page.$('#StationSetupFooter .f9-positive-cta-btn, #StationSetupFooter button.pull-right')
+      if (nextBtn && await nextBtn.isVisible()) {
+        console.log('[F9 login] Station setup — clicking Next...')
         await nextBtn.click()
         await sleep(2000)
       }
       continue
     }
 
-    // ── Existing session modal ────────────────────────────────────────────────
+    // ── Existing session modal ("Login failed - another session exists.
+    // Force logout of other session?") — real markup confirmed via live
+    // DevTools inspection:
+    //   <div id="okay-cancel-dialog" class="f9-modal">
+    //     ...
+    //     <button id="OkCancelDialog-force-button" class="f9-positive-cta-btn
+    //       btn pull-right ok-button">Force</button>
+    //   </div>
+    // Always click Force (per explicit instruction) — this scraper's own
+    // login should always take over rather than leave a stale session
+    // blocking it.
+    const forceBtn = await page.$('#OkCancelDialog-force-button')
+    if (forceBtn && await forceBtn.isVisible()) {
+      console.log('[F9 login] Existing session modal — clicking Force...')
+      await forceBtn.click()
+      await sleep(2000)
+      continue
+    }
+
+    // Older guessed selectors, kept as a fallback — never confirmed to match
+    // real Five9 markup, but harmless to keep checking.
     const continueBtn = await page.$(
       '#existing-session-continue, ' +
       '[class*="existing-session"] button, ' +
       'button[data-id="continue"]'
     )
-    if (continueBtn) {
+    if (continueBtn && await continueBtn.isVisible()) {
       console.log('[F9 login] Existing session modal — clicking Continue...')
       await continueBtn.click()
       await sleep(2000)
@@ -255,6 +439,38 @@ async function handleFive9Login(page, account) {
     // ── React login form (#Login-username-input) ─────────────────────────────
     const reactUsername = await page.$('#Login-username-input')
     if (reactUsername) {
+      // A prior submit (this same login() call looping back round) may still
+      // be processing behind Five9's "please wait" blocking overlay — wait
+      // it out before ever considering the form fillable again. Otherwise
+      // this re-fills/resubmits credentials on top of a still-pending
+      // submission. See waitForLoginOverlayToClear()'s comment.
+      await waitForLoginOverlayToClear(page)
+
+      // The SPA renders this element's ID before it's actually finished
+      // bootstrapping — a blank loading-spinner state with the login form's
+      // skeleton (including #Login-login-button) already in the DOM but
+      // collapsed to zero size and empty of text. Confirmed by direct
+      // screenshot: only Five9's loading spinner was visible while this
+      // exact selector already matched. Racing this (filling + clicking
+      // before it's done) hangs for the full click timeout against a button
+      // that will never become clickable in this state. Wait for it to
+      // actually render before touching the form.
+      try {
+        await page.waitForFunction(() => {
+          const btn = document.querySelector('#Login-login-button')
+          return btn && btn.getBoundingClientRect().width > 0
+        }, { timeout: 20000 })
+      } catch {
+        // Fall through — the post-submit check below still catches a
+        // genuinely stuck state instead of hanging silently forever.
+      }
+
+      // An error from a PRIOR submit (this same login() call looping back
+      // round) still showing means the credentials are bad — stop now
+      // instead of blindly refilling/resubmitting. See checkLoginError().
+      const priorError = await checkLoginError(page)
+      if (priorError) throw new Error(`Five9 login error: ${priorError}`)
+
       console.log('[F9 login] React login form — filling credentials...')
       if (!username || !password) throw new Error('Five9 username/password not set in config.json')
       await reactUsername.focus()
@@ -271,14 +487,40 @@ async function handleFive9Login(page, account) {
         await sleep(400)
       }
       console.log('[F9 login] Clicking Log In...')
-      await page.click('#Login-login-button')
-      await sleep(3500)
+      // The credentials dialog itself (#Login-user-credentials-dialog) can
+      // flip to display:none and back while Five9 is still settling on a
+      // slow boot — not a one-time race, an ongoing flicker. A failed click
+      // here means Playwright never actually performed it (confirmed: its
+      // retry log shows only failed "not visible" waits, zero clicks), so
+      // there's no risk of a duplicate real submission — just re-check page
+      // state and try again instead of failing the whole login() call.
+      try {
+        await page.click('#Login-login-button', { timeout: 15000 })
+      } catch (clickErr) {
+        console.log(`[F9 login] Click failed (form flickered?) — re-evaluating page state: ${clickErr.message.split('\n')[0]}`)
+        continue
+      }
+      await sleep(1000)
+      // Let the "please wait" overlay run its course before deciding
+      // anything about the result — otherwise the NEXT pass through this
+      // loop can land back here mid-overlay and try to resubmit.
+      await waitForLoginOverlayToClear(page)
+      await sleep(1000)
+
+      // Check the RESULT of this submit before ever looping back — a bad
+      // password can render the login form's own labels blank instead of a
+      // conventional error box, so also treat that as a failure signal.
+      const postSubmitError = await checkLoginError(page)
+      if (postSubmitError) throw new Error(`Five9 login error: ${postSubmitError}`)
       continue
     }
 
     // ── Plain HTML login form (login.five9.com) ───────────────────────────────
     const plainUsername = await page.$('#username')
     if (plainUsername) {
+      const priorError = await checkLoginError(page)
+      if (priorError) throw new Error(`Five9 login error: ${priorError}`)
+
       console.log('[F9 login] Plain login form — filling credentials...')
       if (!username || !password) throw new Error('Five9 username/password not set in config.json')
       await page.fill('#username', username)
@@ -287,6 +529,9 @@ async function handleFive9Login(page, account) {
       await sleep(400)
       await page.click('#loginBtn')
       await sleep(3500)
+
+      const postSubmitError = await checkLoginError(page)
+      if (postSubmitError) throw new Error(`Five9 login error: ${postSubmitError}`)
       continue
     }
 
@@ -795,7 +1040,29 @@ module.exports = {
     page.on('pageerror', err => console.warn(`[perfectserve page error] ${err.message}`))
 
     console.log(`[perfectserve] Navigating to Five9 supervisor...`)
-    await page.goto(SUPERVISOR_URL, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    // Five9 itself is sometimes slow/overloaded enough that even this FIRST
+    // navigation doesn't reach domcontentloaded within 30s — confirmed live
+    // (the "Unable to load the application" page was already visibly
+    // rendered when this threw, meaning the SERVER side, not our page, was
+    // the slow part). This happens BEFORE handleFive9Login() ever runs, so
+    // its own reload/retry loop never gets a chance — this needs its own
+    // retry. 'commit' (fires once the response starts arriving, well before
+    // full parse) is also more lenient than 'domcontentloaded' here, since
+    // handleFive9Login already tolerates a not-yet-fully-loaded page.
+    const NAV_RETRIES = 5
+    const NAV_TIMEOUT = 45000
+    let navigated = false
+    for (let i = 1; i <= NAV_RETRIES; i++) {
+      try {
+        await page.goto(SUPERVISOR_URL, { waitUntil: 'commit', timeout: NAV_TIMEOUT })
+        navigated = true
+        break
+      } catch (err) {
+        console.log(`[perfectserve] Navigation attempt ${i}/${NAV_RETRIES} failed: ${err.message.split('\n')[0]}`)
+        if (i < NAV_RETRIES) await new Promise(r => setTimeout(r, 5000))
+      }
+    }
+    if (!navigated) throw new Error(`Failed to reach Five9 supervisor after ${NAV_RETRIES} attempts`)
 
     await handleFive9Login(page, account)
     await waitForDashboard(page)
@@ -824,6 +1091,11 @@ module.exports = {
       return data
     } catch (err) {
       console.error(`[perfectserve] scrape error:`, err.message)
+      // A closed page/context/browser isn't a normal empty scrape — retrying
+      // login() on a dead page object (what an empty-scrape "recovery" does)
+      // can never fix it. Re-throw so AccountRunner's fatal-error branch does
+      // a full relaunch instead. See lib/scrape-errors.js.
+      if (isFatalPageError(err.message)) throw err
       return null
     }
   },
