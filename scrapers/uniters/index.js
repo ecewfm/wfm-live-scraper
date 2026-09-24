@@ -26,7 +26,11 @@ const { isFatalPageError } = require('../../lib/scrape-errors')
 // The Uniters Chrome extension matched both app-scl and app-atl. Defaulting to
 // app-atl (same as PerfectServe). If login lands on the wrong host / an error
 // page for Uniters, switch this to 'https://app-scl.five9.com/'.
-const SUPERVISOR_URL = 'https://app-atl.five9.com/'
+// CONFIRMED live (2026-09-24, via a real dashboard screenshot showing the
+// actual URL): this account's Five9 tenant is on the SCL shard, not ATL —
+// the earlier "defaulting to app-atl, switch to app-scl if wrong" note
+// (see file header history) was the wrong guess.
+const SUPERVISOR_URL = 'https://app-scl.five9.com/'
 // Five9 itself sometimes shows "Unable to load the application. Please retry
 // in a few minutes." on a slow/overloaded boot — confirmed live, unrelated to
 // credentials. handleFive9Login reloads and keeps waiting when it sees this,
@@ -196,6 +200,51 @@ async function waitForLoginOverlayToClear(page, timeout = 20000) {
   }
 }
 
+// ── State fingerprint + stuck-state diagnostic ───────────────────────────────
+// A cheap, single evaluate() per pass that names which known state the login
+// loop currently sees. If the SAME fingerprint repeats for several passes in
+// a row (the loop isn't actually making progress — navigation is stuck, or
+// some step is silently failing to trigger), dump a live DOM scan before
+// continuing to retry, instead of just retrying blind — requested directly
+// after a real stuck-navigation incident, so the terminal itself surfaces
+// what's actually on screen rather than needing a separate manual DevTools
+// probe every time this happens again.
+async function computeStateFingerprint(page) {
+  return page.evaluate(() => {
+    const vis = el => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 }
+    if (document.querySelector('#fatal-error')?.classList.contains('show')) return 'app-load-failure'
+    if (vis(document.querySelector('#StationSetupScreen'))) return 'station-setup'
+    if (vis(document.querySelector('a.home-link.supervisor, [class*="role-card"] a[href*="supervisor"], a[href*="DomainSupervisor"], .at-t-applications__card'))) return 'role-card'
+    if (vis(document.querySelector('#OkCancelDialog-force-button'))) return 'existing-session-modal'
+    if (document.querySelector('#Login-username-input')) return 'react-login-form'
+    if (document.querySelectorAll('.stat-view, .stat-threshold-container, .f9-widget-grid-row').length > 0) return 'dashboard-widgets'
+    return 'unrecognized:' + location.pathname + location.hash
+  }).catch(() => 'eval-error')
+}
+
+async function dumpLoginDiagnostic(page) {
+  try {
+    const info = await page.evaluate(() => {
+      const box = el => { if (!el) return null; const r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) } }
+      return {
+        url: location.href,
+        title: document.title,
+        loginUsernameInput: box(document.querySelector('#Login-username-input')),
+        loginButton: box(document.querySelector('#Login-login-button')),
+        stationSetup: box(document.querySelector('#StationSetupScreen')),
+        supervisorCard: box(document.querySelector('a.home-link.supervisor')),
+        forceButton: box(document.querySelector('#OkCancelDialog-force-button')),
+        fatalErrorShowing: document.querySelector('#fatal-error')?.classList.contains('show') || false,
+        dashboardWidgetCount: document.querySelectorAll('.stat-view, .stat-threshold-container, .f9-widget-grid-row').length,
+        bodyTextSample: (document.body.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 300),
+      }
+    })
+    console.warn('[F9 login] 🔍 Stuck-state diagnostic scan:', JSON.stringify(info, null, 2))
+  } catch (err) {
+    console.warn('[F9 login] diagnostic scan itself failed:', err.message)
+  }
+}
+
 // ── Is the Station Setup screen currently showing? ───────────────────────────
 // Confirmed via live DevTools inspection: <div id="StationSetupScreen">. This
 // SPA does NOT change the URL between Station Setup and the real dashboard —
@@ -226,11 +275,29 @@ async function handleFive9Login(page, account) {
 
   const deadline = Date.now() + LOGIN_TIMEOUT
   let   pass     = 0
+  let   lastFingerprint = null
+  let   stuckStreak     = 0
 
   while (Date.now() < deadline) {
     pass++
     const url = page.url()
     console.log(`[F9 login] pass=${pass} url=${url.substring(0, 80)}`)
+
+    // ── Scan before continuing if navigation seems stuck ────────────────────
+    // See computeStateFingerprint/dumpLoginDiagnostic's comment — requested
+    // directly after a real incident where the loop appeared to hang between
+    // Supervisor-card and dashboard with no visibility into why.
+    const fingerprint = await computeStateFingerprint(page)
+    if (fingerprint === lastFingerprint) {
+      stuckStreak++
+    } else {
+      stuckStreak = 0
+      lastFingerprint = fingerprint
+    }
+    if (stuckStreak > 0 && stuckStreak % 4 === 0) {
+      console.warn(`[F9 login] Same state ("${fingerprint}") for ${stuckStreak} passes in a row — scanning before continuing...`)
+      await dumpLoginDiagnostic(page)
+    }
 
     // ── Dashboard loaded? ────────────────────────────────────────────────────
     // MUST also confirm Station Setup isn't still showing — see
@@ -404,7 +471,14 @@ async function handleFive9Login(page, account) {
 
       console.log('[F9 login] React login form — filling credentials...')
       if (!username || !password) throw new Error('Five9 username/password not set in config.json for "uniters"')
-      await reactUsername.focus()
+      // Use a Locator (re-resolves fresh against the live DOM) rather than
+      // the `reactUsername` ElementHandle grabbed above — CONFIRMED live:
+      // the several awaits between grabbing that handle and using it here
+      // (overlay-wait, render-wait, error-check) gave React enough time to
+      // re-render and detach that exact node, throwing "Element is not
+      // attached to the DOM" on .focus(). A Locator has no such staleness
+      // window since it queries at the moment of the call.
+      await page.locator('#Login-username-input').focus().catch(() => {})
       await reactFill(page, '#Login-username-input', username)
       await sleep(300)
       await reactFill(page, '#Login-password-input', password)
@@ -546,18 +620,33 @@ const scrapeDOM = async function () {
       .map(el => el.innerText.trim()).filter(h => h && h !== 'Actions')
     const rows = []
 
-    // New grid row method (Uniters account): cells positional, headers by index
+    // New grid row method (Uniters account) — CONFIRMED live (2026-09-24) on
+    // the account's current custom "My Views" dashboard: keyed by the STABLE
+    // data-column-id attribute on each .f9-widget-grid-cell, NOT by column
+    // POSITION. The three grids (Not Ready / Ready / On a Call) have
+    // DIFFERENT column orders — e.g. "email" sits at position 6 in Not Ready
+    // but position 4 in Ready — so the previous positional cells[0]/cells[1]
+    // reading (name/email always first two columns) was silently
+    // misattributing values across those different layouts. colMap is now
+    // keyed by data-column-id (e.g. "fullName", "reasonCodeName",
+    // "stateDuration", "state", "presenceLabel", "reasonCodeDuration",
+    // "email", "agentGroups", "onHoldStateDuration", "onHoldStateSince",
+    // "campaignName") — see the downstream agentsNotReady/agentsReady/
+    // agentsOnCall pushes below, updated to match these exact keys.
     const gridRows = widget.querySelectorAll('.f9-widget-grid-row')
     if (gridRows.length > 0) {
       gridRows.forEach(rowEl => {
-        const cells = Array.from(rowEl.querySelectorAll('.f9-widget-grid-cell-inner'))
-          .map(c => c.innerText.trim())
+        const cells = Array.from(rowEl.querySelectorAll('.f9-widget-grid-cell[data-column-id]'))
         if (cells.length === 0) return
-        const name  = cells[0] || ''
-        const email = cells[1] || ''
-        if (!name) return
         const colMap = {}
-        colHeaders.forEach((col, idx) => { colMap[col] = cells[idx] !== undefined ? cells[idx] : '' })
+        cells.forEach(c => {
+          const colId = c.getAttribute('data-column-id')
+          if (!colId) return
+          colMap[colId] = c.querySelector('.f9-widget-grid-cell-inner')?.innerText.trim() || ''
+        })
+        const name  = colMap.fullName || ''
+        const email = colMap.email || ''
+        if (!name) return
         rows.push({ name, username: email, email, colMap })
       })
       return rows
@@ -705,66 +794,58 @@ const scrapeDOM = async function () {
       })
     }
 
-    // Not Ready
+    // Not Ready — confirmed live column set: fullName, reasonCodeName,
+    // stateDuration, state, presenceLabel, reasonCodeDuration, email,
+    // agentGroups.
     else if (/not ready/i.test(header) || /^agents on not ready/i.test(header)) {
       const rows = await scrollAndCollectRows(widget)
       rows.forEach(({ name, username, email, colMap }) => {
         agentsNotReady.push({
           name, username,
-          email:            email || colMap['Email'] || username,
+          email:            email || colMap.email || username,
           state:            'Not Ready',
-          currentState:     colMap['Current State']    || '',
-          duration:         colMap['State Duration']   || colMap['State Timer'] || '',
-          reason:           colMap['Reason Code']      || '',
-          reasonDuration:   colMap['Reason Duration']  || '',
-          acwDuration:      colMap['ACW Duration']     || '',
-          callDuration:     colMap['On Call Duration'] || '',
-          stateSince:       colMap['State Since']      || '',
-          voiceWL:          colMap['Voice WL']         || '',
-          agentGroups:      colMap['Agent Groups']     || '',
-          userProfile:      colMap['User Profile']     || ''
+          currentState:     colMap.presenceLabel      || '',
+          duration:         colMap.stateDuration      || '',
+          reason:           colMap.reasonCodeName     || '',
+          reasonDuration:   colMap.reasonCodeDuration || '',
+          agentGroups:      colMap.agentGroups        || ''
         })
       })
     }
 
-    // On Call
+    // On Call — confirmed live column set: fullName, state, stateDuration,
+    // campaignName, onHoldStateDuration, onHoldStateSince, presenceLabel.
     else if (/^on call/i.test(header) || /^agents on a call/i.test(header)) {
       const rows = await scrollAndCollectRows(widget)
       rows.forEach(({ name, username, email, colMap }) => {
         agentsOnCall.push({
           name, username,
-          email:            email || colMap['Email'] || username,
+          email:            email || colMap.email || username,
           state:            'On Call',
-          currentState:     colMap['Current State']    || '',
-          duration:         colMap['State Duration']   || colMap['State Timer'] || '',
-          onHoldDuration:   colMap['On Hold Duration'] || '',
-          onHoldSince:      colMap['On Hold Since']    || '',
-          callDuration:     colMap['On Call Duration'] || '',
-          stateSince:       colMap['State Since']      || '',
-          customer:         colMap['Customer']         || '',
-          voiceWL:          colMap['Voice WL']         || '',
-          agentGroups:      colMap['Agent Groups']     || '',
-          userProfile:      colMap['User Profile']     || ''
+          currentState:     colMap.presenceLabel        || '',
+          duration:         colMap.stateDuration        || '',
+          onHoldDuration:   colMap.onHoldStateDuration  || '',
+          onHoldSince:      colMap.onHoldStateSince     || '',
+          campaign:         colMap.campaignName         || ''
         })
       })
     }
 
-    // Ready for Calls
+    // Ready for Calls — confirmed live column set: fullName, state,
+    // stateDuration, presenceLabel, email, onHoldStateDuration,
+    // onHoldStateSince, agentGroups.
     else if (/ready for calls/i.test(header) || /^agents on ready/i.test(header)) {
       const rows = await scrollAndCollectRows(widget)
       rows.forEach(({ name, username, email, colMap }) => {
         agentsReady.push({
           name, username,
-          email:            email || colMap['Email'] || username,
+          email:            email || colMap.email || username,
           state:            'Ready',
-          currentState:     colMap['Current State']    || '',
-          duration:         colMap['State Duration']   || colMap['State Timer'] || '',
-          onHoldDuration:   colMap['On Hold Duration'] || '',
-          onHoldSince:      colMap['On Hold Since']    || '',
-          stateSince:       colMap['State Since']      || '',
-          voiceWL:          colMap['Voice WL']         || '',
-          agentGroups:      colMap['Agent Groups']     || '',
-          userProfile:      colMap['User Profile']     || ''
+          currentState:     colMap.presenceLabel       || '',
+          duration:         colMap.stateDuration       || '',
+          onHoldDuration:   colMap.onHoldStateDuration || '',
+          onHoldSince:      colMap.onHoldStateSince    || '',
+          agentGroups:      colMap.agentGroups         || ''
         })
       })
     }

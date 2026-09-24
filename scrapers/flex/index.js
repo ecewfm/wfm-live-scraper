@@ -110,27 +110,27 @@
 // tick. This is a coarse, whole-dashboard signal, not per-tile — a PARTIAL
 // failure (some tiles fine, others erroring) does not currently trigger it.
 //
-// LOGIN: manualLogin (see meta below) — CONFIRMED (not assumed, unlike the
-// first draft of this file): sign-in is "Sign in with Google" → a Google
-// account-picker/password popup → an authenticator app 2FA code prompt →
-// only THEN the real dashboard. None of that is a Zendesk-native email/
-// password form, so there is NO credential auto-login attempt here at all —
-// same posture as scrapers/homebase/index.js's Okta SSO (a visible,
-// persistent-profile browser that just navigates and WAITS; a human does
-// the entire Google+2FA flow by hand, then runs `resume flex` in the
-// scraper.js terminal). Unlike edenhealth/wyze (a plain Zendesk credential
-// form where an optimistic auto-login CAN sometimes skip a trusted device's
-// MFA), there is no equivalent shortcut available here — every session
-// expiry gates for a human, no exceptions. (The Geckoboard board needs none
+// LOGIN: sign-in is "Sign in with Google" → a Google account-picker → the
+// real dashboard. account.email holds the Google account's own address
+// (e.g. abdul.mandangan.e@getflex.com) — attemptGoogleSignIn() clicks
+// "Sign in with Google" then picks that account from Google's chooser.
+// Because the persisted profile (sessions/flex-profile/, manualLogin's
+// on-disk Chrome profile) already has this Google account's session
+// remembered from the one-time manual setup, this normally needs no
+// password or 2FA at all — CONFIRMED by the client's own description of
+// their manual flow (Sign in with Google → click the one remembered
+// account → straight to the dashboard). meta.manualLogin stays true as a
+// fallback: if the remembered session ever needs fresh consent (a real
+// password/2FA prompt appears), attemptGoogleSignIn() gives up cleanly and
+// this falls back to waiting for a human (`resume flex`), same posture as
+// scrapers/homebase/index.js's Okta SSO. (The Geckoboard board needs none
 // of this — a public share link has no login step of its own.)
 //
-// config.json entry needed (email/password are UNUSED by login() — kept
-// only in case Flex ever exposes a scriptable login path later, same as
-// scrapers/homebase/index.js's vestigial fields):
+// config.json entry needed:
 //   {
 //     "id": "flex",
 //     "type": "zendesk",
-//     "email": "",
+//     "email": "abdul.mandangan.e@getflex.com",
 //     "password": "",
 //     "dashboardUrl": "https://getflex.zendesk.com/agent/filters/22437671830423?brand_id=360002102693",
 //     "exploreUrl": "https://getflex.zendesk.com/explore/studio?brand_id=360002102693#/dashboards/precanned/13EAEF5951D595E3281C80635C5BE556547FE5A572EE6A091B1237E8C49E4EBA",
@@ -241,6 +241,81 @@ async function pruneDeparted(table, accountId, currentIds) {
 // miss an intermediate redirect step and misreport "logged in" too early.
 function isLoginUrl(url) {
   return !/getflex\.zendesk\.com\/agent\//.test(url || '')
+}
+
+// ── Automated "Sign in with Google" — the persisted profile (sessions/
+// flex-profile/, see lib/browser.js's persistent-profile mode for manualLogin
+// accounts) already has this account's Google session remembered from the
+// one-time manual setup, so picking it from Google's account-chooser needs no
+// password or 2FA re-entry — CONFIRMED by the client's own description of
+// their manual flow: "Sign in with Google" → click the one remembered account
+// → straight to the dashboard, no further prompts. This is an OPTIMISTIC
+// attempt only: if the remembered session ever needs re-consent (a real
+// password/2FA prompt appears, or the expected elements just aren't there),
+// this gives up and returns without throwing — login()'s caller
+// (account-runner.js, for every manualLogin account) already re-checks
+// isSessionExpired() afterward and falls back to waiting for a human exactly
+// as before if this didn't actually get all the way in.
+// account.email holds the Google account's own address (e.g.
+// abdul.mandangan.e@getflex.com) — repurposing the config field that this
+// file's header previously called "unused... in case Flex ever exposes a
+// scriptable login path later."
+async function attemptGoogleSignIn(page, account) {
+  const email = account.email || ''
+  if (!email) {
+    console.warn('[flex] No account.email configured — cannot pick a Google account automatically')
+    return false
+  }
+
+  try {
+    console.log('[flex] Attempting automated "Sign in with Google"...')
+    const googleBtn = page.locator('text=Sign in with Google').first()
+    const hasGoogleBtn = await googleBtn.waitFor({ timeout: 10000 }).then(() => true).catch(() => false)
+    if (hasGoogleBtn) {
+      await googleBtn.click()
+    } else if (!/accounts\.google\.com/.test(page.url())) {
+      console.log('[flex] "Sign in with Google" button not found — giving up on automated sign-in')
+      return false
+    }
+
+    // Google may go straight to the account chooser, straight back to Flex
+    // (if it silently resumes an existing session with no picker at all), or
+    // — if the remembered session needs fresh consent — a real
+    // password/2FA prompt. Only the first two are handled here.
+    await page.waitForURL(/accounts\.google\.com|getflex\.zendesk\.com\/agent\//, { timeout: 20000 }).catch(() => {})
+
+    if (/accounts\.google\.com/.test(page.url())) {
+      console.log(`[flex] Google account chooser — selecting ${email}...`)
+      const byIdentifier = page.locator(`[data-identifier="${email}"]`).first()
+      const found = await byIdentifier.waitFor({ timeout: 8000 }).then(() => true).catch(() => false)
+      if (found) {
+        await byIdentifier.click()
+      } else {
+        // Fallback: the exact data-identifier attribute isn't guaranteed —
+        // find whichever element's own visible text contains the email and
+        // click it (clicks bubble to the tile's real click handler even if
+        // this isn't the outermost clickable container).
+        const byText = page.locator(`text=${email}`).first()
+        const foundByText = await byText.waitFor({ timeout: 5000 }).then(() => true).catch(() => false)
+        if (!foundByText) {
+          console.warn(`[flex] Could not find a Google account tile for ${email}`)
+          return false
+        }
+        await byText.click()
+      }
+      await page.waitForURL(/getflex\.zendesk\.com\/agent\//, { timeout: 20000 }).catch(() => {})
+    }
+
+    await page.waitForTimeout(1500)
+    const success = !isLoginUrl(page.url())
+    console.log(success
+      ? '[flex] ✅ Automated Google sign-in succeeded'
+      : '[flex] Automated Google sign-in did not complete (still on a login/consent page)')
+    return success
+  } catch (err) {
+    console.warn(`[flex] Automated Google sign-in error: ${err.message}`)
+    return false
+  }
 }
 
 // ── Wait for the General view's ticket table to actually have rows ─────────
@@ -413,25 +488,42 @@ const EXPLORE_PAGES = new Map() // accountId -> Page
 
 async function ensureExplorePage(context, account) {
   let p = EXPLORE_PAGES.get(account.id)
-  if (p && !p.isClosed()) return p
+  if (!p || p.isClosed()) {
+    p = await context.newPage()
+    EXPLORE_PAGES.set(account.id, p)
+    p.on('pageerror', () => {})
+    // CONFIRMED root cause of a real production hang (2026-09-18): the Looker/
+    // Explore embed's SPA apparently registers a beforeunload handler, so
+    // page.reload() (see scrapeExploreDashboard's widget-error recovery) can
+    // trigger a native "Leave site?" confirm dialog. Playwright leaves any
+    // dialog open indefinitely unless something explicitly responds to it —
+    // with no handler, that reload() call (and every awaited Playwright call
+    // after it) hung forever, which froze this account's tick() permanently
+    // (account-runner.js's _ticking guard never gets to reset in its `finally`
+    // because the awaited scrape() call itself never resolves). Auto-dismiss
+    // every dialog on this page so a reload can never get stuck waiting on one.
+    p.on('dialog', d => d.dismiss().catch(() => {}))
+    await p.goto(account.exploreUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
+      console.warn(`[flex] explore goto failed: ${e.message}`)
+    })
+  }
 
-  p = await context.newPage()
-  EXPLORE_PAGES.set(account.id, p)
-  p.on('pageerror', () => {})
-  // CONFIRMED root cause of a real production hang (2026-09-18): the Looker/
-  // Explore embed's SPA apparently registers a beforeunload handler, so
-  // page.reload() (see scrapeExploreDashboard's widget-error recovery) can
-  // trigger a native "Leave site?" confirm dialog. Playwright leaves any
-  // dialog open indefinitely unless something explicitly responds to it —
-  // with no handler, that reload() call (and every awaited Playwright call
-  // after it) hung forever, which froze this account's tick() permanently
-  // (account-runner.js's _ticking guard never gets to reset in its `finally`
-  // because the awaited scrape() call itself never resolves). Auto-dismiss
-  // every dialog on this page so a reload can never get stuck waiting on one.
-  p.on('dialog', d => d.dismiss().catch(() => {}))
-  await p.goto(account.exploreUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
-    console.warn(`[flex] explore goto failed: ${e.message}`)
-  })
+  // This tab shares Zendesk's login session with the main ticket view but
+  // has been confirmed live to expire INDEPENDENTLY of it (the main page
+  // stayed logged in while this separate cached tab silently redirected to
+  // the Google sign-in screen on its own) — and since this page is reused
+  // across ticks rather than recreated, nothing else ever re-checks it.
+  // Re-validate and re-authenticate on every call, not just at creation.
+  if (isLoginUrl(p.url())) {
+    console.log('[flex] Explore page session expired — attempting automated Google sign-in...')
+    const signedIn = await attemptGoogleSignIn(p, account)
+    if (signedIn) {
+      await p.goto(account.exploreUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
+    } else {
+      console.warn('[flex] Explore page automated sign-in did not complete — will retry next tick')
+    }
+  }
+
   return p
 }
 
@@ -857,18 +949,17 @@ module.exports = {
   meta: {
     type:        'zendesk',
     interval:    30000,
-    manualLogin: true,   // Google SSO + 2FA, confirmed — see file header. Waits for `resume flex`
+    manualLogin: true,   // kept as a fallback — see attemptGoogleSignIn()'s comment
   },
 
-  // ── Login: manual — navigate and WAIT for a human. Google SSO + an
-  // authenticator 2FA prompt can never be scripted, so unlike edenhealth/
-  // wyze there is no credential auto-login attempt to try first here at all
-  // (same posture as scrapers/homebase/index.js's Okta SSO). When the
-  // persisted session is still valid, this lands straight on the ticket
-  // view and proceeds straight to the one-time setup below; otherwise it
-  // just waits — log in (Google + 2FA) by hand in the visible browser
-  // window, then in the scraper.js terminal run:
-  //     resume flex
+  // ── Login: try automated "Sign in with Google" first (see
+  // attemptGoogleSignIn() — works because the persisted profile already
+  // remembers this account's Google session), falling back to waiting for a
+  // human if that doesn't fully resolve (e.g. the remembered session ever
+  // needs fresh password/2FA consent) — same optimistic-then-fallback pattern
+  // as scrapers/edenhealth/index.js. account-runner.js already re-checks
+  // isSessionExpired() after this returns for every manualLogin account, so
+  // no extra plumbing is needed here beyond just trying.
   async login(page, context, account, sessionPath) {
     page.on('pageerror', err => console.warn(`[flex page error] ${err.message}`))
     page.on('dialog', d => d.dismiss().catch(() => {})) // see ensureExplorePage's comment — a beforeunload dialog on ANY page can hang every future Playwright call on it
@@ -879,8 +970,11 @@ module.exports = {
     await page.waitForTimeout(1500)
 
     if (isLoginUrl(page.url())) {
-      console.log('[flex] Not authenticated — manual "Sign in with Google" + 2FA required. Waiting for human (resume flex once done)...')
-      return
+      const signedIn = await attemptGoogleSignIn(page, account)
+      if (!signedIn) {
+        console.log('[flex] Automated sign-in did not complete — waiting for human (resume flex once done)...')
+        return
+      }
     }
 
     if (!page.url().includes('/agent/filters/')) {
@@ -918,6 +1012,23 @@ module.exports = {
     // trying to click "Previous" back from wherever last tick's "Next"
     // clicking left off.
     await page.goto(account.dashboardUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
+
+    // account-runner.js's own isSessionExpired()+auto-login retry only runs
+    // BEFORE this scrape() call — if the session was fine at tick-start but
+    // THIS goto() itself lands on the login page (expired sometime between
+    // ticks), that gap was never caught. Attempt sign-in right here too
+    // instead of silently returning empty.
+    if (isLoginUrl(page.url())) {
+      console.log('[flex] Main page session expired mid-tick — attempting automated Google sign-in...')
+      const signedIn = await attemptGoogleSignIn(page, account)
+      if (signedIn) {
+        await page.goto(account.dashboardUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
+      } else {
+        console.warn('[flex] Main page automated sign-in did not complete — will retry next tick')
+        return { hasData: false }
+      }
+    }
+
     await waitForTicketTable(page).catch(() => {})
 
     let tickets = []

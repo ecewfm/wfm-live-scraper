@@ -380,6 +380,30 @@ function scrapeExploreKpis() {
   return result
 }
 
+// Confirmed live: the Explore embed can show "You do not have appropriate
+// access to this resource." across nearly every tile at once instead of real
+// data — a known, apparently transient permissions/session hiccup on Zendesk
+// Explore's side, same "looks fine structurally, data is broken" shape as
+// scrapers/flex/index.js's looksLikeWidgetError(). Deliberately does NOT
+// depend on scrapeExploreKpis()'s own kpi-queryid-* selectors — CONFIRMED
+// this exact error state can render in a DIFFERENT DOM layout (no
+// kpi-queryid-* classes at all; the page even banners "These dashboards are
+// being replaced" — this looks like a newer dashboard variant), which would
+// leave `kpis` empty and never trigger a reload even though the failure is
+// obvious. Scans the page's raw text directly instead, independent of
+// whatever tile markup happens to be present.
+async function countExploreAccessErrors(page) {
+  return page.evaluate(() => {
+    const needle = 'you do not have appropriate access'
+    let count = 0
+    document.querySelectorAll('body *').forEach(el => {
+      if (el.children.length > 0) return // leaf nodes only — avoid double-counting via ancestors
+      if ((el.textContent || '').toLowerCase().includes(needle)) count++
+    })
+    return count
+  }).catch(() => 0)
+}
+
 // ── Write to Supabase ──────────────────────────────────────────────────────
 async function writeEdenHealthData(data, accountId) {
   const now = new Date().toISOString()
@@ -504,6 +528,23 @@ module.exports = {
         await explorePage.goto(account.exploreUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {})
       }
       kpis = await explorePage.evaluate(scrapeExploreKpis)
+
+      const accessErrorCount = await countExploreAccessErrors(explorePage)
+      // Require several at once (not just one) so a single legitimately-
+      // restricted tile doesn't trigger a pointless reload every tick.
+      if (accessErrorCount >= 3) {
+        console.warn(`[edenhealth] Explore page shows ${accessErrorCount} "You do not have appropriate access" tile(s) — reloading and retrying once...`)
+        await explorePage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
+          console.warn(`[edenhealth] Explore reload failed: ${e.message}`)
+        })
+        await explorePage.waitForFunction(
+          () => document.querySelectorAll('.kpi-first-measure-value').length >= 3,
+          { timeout: 60000 }
+        ).catch(() => {
+          console.warn('[edenhealth] explore KPI tiles never reloaded (will retry next tick)')
+        })
+        kpis = await explorePage.evaluate(scrapeExploreKpis)
+      }
     } catch (err) {
       console.warn(`[edenhealth] KPI scrape failed: ${err.message}`)
     }

@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Ashley LivePerson Chat Scraper",
+  "version": "1.0.0",
+  "description": "Scrapes Ashley LivePerson Manager Workspace dashboard and exports data to Google Drive as CSVs.",
+
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "identity",
+    "tabs",
+    "windows"
+  ],
+
+  "host_permissions": [
+    "https://z1.le.liveperson.net/*",
+    "https://www.googleapis.com/*"
+  ],
+
+  "oauth2": {
+    "client_id": "661796805567-3uheioegf9jgb12coqba0o3pbt86livq.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive"
+    ]
+  },
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Ashley Chat Scraper"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://z1.le.liveperson.net/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

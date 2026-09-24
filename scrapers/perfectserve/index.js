@@ -242,6 +242,51 @@ async function waitForLoginOverlayToClear(page, timeout = 20000) {
   }
 }
 
+// ── State fingerprint + stuck-state diagnostic ───────────────────────────────
+// A cheap, single evaluate() per pass that names which known state the login
+// loop currently sees. If the SAME fingerprint repeats for several passes in
+// a row (the loop isn't actually making progress — navigation is stuck, or
+// some step is silently failing to trigger), dump a live DOM scan before
+// continuing to retry, instead of just retrying blind — requested directly
+// after a real stuck-navigation incident, so the terminal itself surfaces
+// what's actually on screen rather than needing a separate manual DevTools
+// probe every time this happens again.
+async function computeStateFingerprint(page) {
+  return page.evaluate(() => {
+    const vis = el => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 }
+    if (document.querySelector('#fatal-error')?.classList.contains('show')) return 'app-load-failure'
+    if (vis(document.querySelector('#StationSetupScreen'))) return 'station-setup'
+    if (vis(document.querySelector('a.home-link.supervisor, [class*="role-card"] a[href*="supervisor"], a[href*="DomainSupervisor"], .at-t-applications__card'))) return 'role-card'
+    if (vis(document.querySelector('#OkCancelDialog-force-button'))) return 'existing-session-modal'
+    if (document.querySelector('#Login-username-input')) return 'react-login-form'
+    if (document.querySelectorAll('.stat-view, .stat-threshold-container, .f9-widget-grid-row').length > 0) return 'dashboard-widgets'
+    return 'unrecognized:' + location.pathname + location.hash
+  }).catch(() => 'eval-error')
+}
+
+async function dumpLoginDiagnostic(page) {
+  try {
+    const info = await page.evaluate(() => {
+      const box = el => { if (!el) return null; const r = el.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) } }
+      return {
+        url: location.href,
+        title: document.title,
+        loginUsernameInput: box(document.querySelector('#Login-username-input')),
+        loginButton: box(document.querySelector('#Login-login-button')),
+        stationSetup: box(document.querySelector('#StationSetupScreen')),
+        supervisorCard: box(document.querySelector('a.home-link.supervisor')),
+        forceButton: box(document.querySelector('#OkCancelDialog-force-button')),
+        fatalErrorShowing: document.querySelector('#fatal-error')?.classList.contains('show') || false,
+        dashboardWidgetCount: document.querySelectorAll('.stat-view, .stat-threshold-container, .f9-widget-grid-row').length,
+        bodyTextSample: (document.body.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 300),
+      }
+    })
+    console.warn('[F9 login] 🔍 Stuck-state diagnostic scan:', JSON.stringify(info, null, 2))
+  } catch (err) {
+    console.warn('[F9 login] diagnostic scan itself failed:', err.message)
+  }
+}
+
 // ── Is the Station Setup screen ("Station Type: Softphone/WebRTC/.../None
 // + Next") currently showing? ─────────────────────────────────────────────
 // Confirmed via live DevTools inspection: <div id="StationSetupScreen">.
@@ -275,11 +320,29 @@ async function handleFive9Login(page, account) {
 
   const deadline = Date.now() + LOGIN_TIMEOUT
   let   pass     = 0
+  let   lastFingerprint = null
+  let   stuckStreak     = 0
 
   while (Date.now() < deadline) {
     pass++
     const url = page.url()
     console.log(`[F9 login] pass=${pass} url=${url.substring(0, 80)}`)
+
+    // ── Scan before continuing if navigation seems stuck ────────────────────
+    // See computeStateFingerprint/dumpLoginDiagnostic's comment — requested
+    // directly after a real incident where the loop appeared to hang between
+    // Supervisor-card and dashboard with no visibility into why.
+    const fingerprint = await computeStateFingerprint(page)
+    if (fingerprint === lastFingerprint) {
+      stuckStreak++
+    } else {
+      stuckStreak = 0
+      lastFingerprint = fingerprint
+    }
+    if (stuckStreak > 0 && stuckStreak % 4 === 0) {
+      console.warn(`[F9 login] Same state ("${fingerprint}") for ${stuckStreak} passes in a row — scanning before continuing...`)
+      await dumpLoginDiagnostic(page)
+    }
 
     // ── Dashboard loaded? Check widgets OR supervisor URL ───────────────────
     // MUST also confirm Station Setup isn't still showing — see
@@ -473,7 +536,15 @@ async function handleFive9Login(page, account) {
 
       console.log('[F9 login] React login form — filling credentials...')
       if (!username || !password) throw new Error('Five9 username/password not set in config.json')
-      await reactUsername.focus()
+      // Use a Locator (re-resolves fresh against the live DOM) rather than
+      // the `reactUsername` ElementHandle grabbed above — CONFIRMED live
+      // (on uniters, identical code path): the several awaits between
+      // grabbing that handle and using it here (overlay-wait, render-wait,
+      // error-check) gave React enough time to re-render and detach that
+      // exact node, throwing "Element is not attached to the DOM" on
+      // .focus(). A Locator has no such staleness window since it queries
+      // at the moment of the call.
+      await page.locator('#Login-username-input').focus().catch(() => {})
       await reactFill(page, '#Login-username-input', username)
       await sleep(300)
       await reactFill(page, '#Login-password-input', password)

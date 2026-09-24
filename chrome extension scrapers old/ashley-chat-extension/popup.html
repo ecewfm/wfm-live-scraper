@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ashley LP Chat Scraper</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 280px;
+      background: #0d1117;
+      color: #e0e0e0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-size: 13px;
+      padding: 14px;
+    }
+    .header {
+      display: flex; align-items: center; gap: 8px;
+      margin-bottom: 14px; padding-bottom: 10px;
+      border-bottom: 1px solid #1f2937;
+    }
+    .header-icon {
+      width: 28px; height: 28px;
+      background: linear-gradient(135deg, #1e3a8a, #3b82f6);
+      border-radius: 6px; display: flex; align-items: center;
+      justify-content: center; font-size: 14px; flex-shrink: 0;
+    }
+    .header-text { flex: 1; }
+    .header-title { font-weight: 700; font-size: 13px; color: #60a5fa; line-height: 1.2; }
+    .header-sub   { font-size: 9px; color: #4b5563; margin-top: 1px; }
+    .status-row {
+      display: flex; align-items: center; gap: 6px;
+      background: #111827; border: 1px solid #1f2937;
+      border-radius: 8px; padding: 8px 10px; margin-bottom: 10px;
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #374151; flex-shrink: 0;
+    }
+    .status-dot.active { background: #3b82f6; box-shadow: 0 0 5px #3b82f6; }
+    .status-dot.found  { background: #22c55e; box-shadow: 0 0 5px #22c55e; }
+    .status-text { font-size: 11px; color: #9ca3af; flex: 1; }
+    .section {
+      background: #111827; border: 1px solid #1f2937;
+      border-radius: 8px; padding: 10px; margin-bottom: 8px;
+    }
+    .section-title {
+      font-size: 9px; color: #6b7280; text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 8px;
+    }
+    .btn {
+      width: 100%; border: none; color: #fff; cursor: pointer;
+      border-radius: 6px; padding: 8px 10px; font-size: 12px;
+      font-weight: 600; margin-bottom: 6px;
+      transition: opacity 0.15s, transform 0.1s; text-align: center;
+    }
+    .btn:last-child  { margin-bottom: 0; }
+    .btn:active      { transform: scale(0.97); }
+    .btn:disabled    { opacity: 0.35; cursor: not-allowed; }
+    .btn-primary  { background: linear-gradient(135deg, #1e3a8a, #3b82f6); }
+    .btn-danger   { background: linear-gradient(135deg, #7f1d1d, #ef4444); }
+    .btn-teal     { background: linear-gradient(135deg, #0d9488, #2dd4bf); }
+    .btn-purple   { background: linear-gradient(135deg, #5b21b6, #8b5cf6); }
+    .btn-gray     { background: linear-gradient(135deg, #1f2937, #374151); }
+    .btn-row {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 6px; margin-bottom: 6px;
+    }
+    .btn-row .btn { margin-bottom: 0; }
+    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-bottom: 6px; }
+    .info-item  { background: #0d1117; border-radius: 5px; padding: 5px 7px; }
+    .info-label { font-size: 9px; color: #4b5563; margin-bottom: 1px; }
+    .info-val   { font-size: 15px; font-weight: 700; color: #fff; line-height: 1.1; }
+    .info-val.blue   { color: #3b82f6; }
+    .info-val.green  { color: #22c55e; }
+    .info-val.yellow { color: #f59e0b; }
+    .drive-display {
+      font-size: 9px; padding: 4px 6px; background: #0d1117;
+      border-radius: 4px; margin-top: 6px; word-break: break-all;
+      min-height: 18px; color: #3b82f6;
+    }
+    .drive-display.none { color: #4b5563; }
+    .log-box {
+      background: #060a0f; border-radius: 5px; padding: 6px;
+      max-height: 100px; overflow-y: auto; font-size: 10px; line-height: 1.4;
+    }
+    .log-entry          { color: #6b7280; padding-bottom: 2px; border-bottom: 1px solid #0d1117; margin-bottom: 2px; }
+    .log-entry.success  { color: #22c55e; }
+    .log-entry.error    { color: #ef4444; }
+    .log-entry.warn     { color: #f59e0b; }
+    .log-entry.info     { color: #6b7280; }
+
+    /* ── Credentials section ── */
+    .cred-toggle-row {
+      display: flex; align-items: center; justify-content: space-between;
+      background: #0d1117; border-radius: 6px; padding: 7px 8px; margin-bottom: 10px;
+    }
+    .cred-toggle-label { font-size: 11px; color: #9ca3af; }
+    .cred-toggle-right { display: flex; align-items: center; gap: 7px; }
+    #autologin-state-label { font-size: 11px; font-weight: 700; color: #22c55e; }
+    #autologin-toggle {
+      width: 36px; height: 20px; background: #22c55e; border-radius: 10px;
+      position: relative; cursor: pointer; transition: background 0.2s; flex-shrink: 0;
+      border: none; outline: none;
+    }
+    #autologin-toggle::after {
+      content: ''; position: absolute; top: 3px; left: 19px;
+      width: 14px; height: 14px; background: #fff;
+      border-radius: 50%; transition: left 0.2s;
+    }
+    #autologin-toggle.paused { background: #374151; }
+    #autologin-toggle.paused::after { left: 3px; }
+
+    .cred-input {
+      width: 100%; background: #0d1117; border: 1px solid #1f2937;
+      border-radius: 5px; color: #e0e0e0; padding: 7px 8px;
+      font-size: 12px; margin-bottom: 6px; outline: none;
+    }
+    .cred-input:focus { border-color: #3b82f6; }
+    .cred-btn-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
+
+    /* ── Save status banner ── */
+    #creds-status {
+      display: none; margin-top: 8px; padding: 8px 10px;
+      border-radius: 6px; font-size: 11px; font-weight: 600;
+      line-height: 1.45; text-align: center;
+      border: 1px solid transparent;
+      animation: fadeIn 0.15s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
+    #creds-status.visible { display: block; }
+    #creds-status.ok   { color: #22c55e; background: #052e16; border-color: #166534; }
+    #creds-status.warn { color: #f59e0b; background: #1c1300; border-color: #78350f; }
+    #creds-status.err  { color: #ef4444; background: #1c0000; border-color: #7f1d1d; }
+
+    .footer {
+      text-align: center; font-size: 9px; color: #374151;
+      margin-top: 10px; padding-top: 8px; border-top: 1px solid #1f2937;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-icon">💬</div>
+    <div class="header-text">
+      <div class="header-title">LP Chat Scraper</div>
+      <div class="header-sub">Ashley LivePerson Manager Workspace</div>
+    </div>
+  </div>
+
+  <div class="status-row">
+    <div class="status-dot" id="page-dot"></div>
+    <div class="status-text" id="page-status">Checking for dashboard...</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Controls</div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-start" disabled>▶ Start Auto</button>
+      <button class="btn btn-danger"  id="btn-stop"  disabled>⏹ Stop</button>
+    </div>
+    <button class="btn btn-primary" id="btn-manual" disabled>⬇ Manual Snapshot</button>
+    <button class="btn btn-teal"    id="btn-export" disabled>⬇ Export All CSVs Now</button>
+    <button class="btn btn-purple"  id="btn-folder">📁 Set Google Drive Folder</button>
+    <button class="btn btn-danger"  id="btn-disconnect" style="display:none">🔌 Disconnect Drive</button>
+    <div class="drive-display none" id="drive-display">No Drive folder set</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Live Metrics</div>
+    <div class="info-grid">
+      <div class="info-item">
+        <div class="info-label">Assigned</div>
+        <div class="info-val blue"   id="m-assigned">-</div>
+      </div>
+      <div class="info-item">
+        <div class="info-label">Load</div>
+        <div class="info-val yellow" id="m-load">-</div>
+      </div>
+      <div class="info-item">
+        <div class="info-label">Closed</div>
+        <div class="info-val green"  id="m-closed">-</div>
+      </div>
+      <div class="info-item">
+        <div class="info-label">CSAT</div>
+        <div class="info-val green"  id="m-csat">-</div>
+      </div>
+    </div>
+    <div style="font-size:9px;color:#4b5563;text-align:right" id="snap-info">Agents: - | Snapshots: 0</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Activity Log</div>
+    <div class="log-box" id="log-box"></div>
+  </div>
+
+  <!-- ── Auto-Login Credentials ──────────────────────────────── -->
+  <div class="section" id="creds-section">
+    <div class="section-title">Auto-Login Credentials</div>
+
+    <div class="cred-toggle-row">
+      <span class="cred-toggle-label">Auto-Login</span>
+      <div class="cred-toggle-right">
+        <span id="autologin-state-label">Enabled</span>
+        <button id="autologin-toggle" title="Toggle auto-login on/off"></button>
+      </div>
+    </div>
+
+    <input id="cred-user" class="cred-input" type="email"     placeholder="LivePerson email" />
+    <input id="cred-pass" class="cred-input" type="password"  placeholder="Password" />
+
+    <div class="cred-btn-row">
+      <button class="btn btn-gray"   id="btn-save-creds"  style="margin-bottom:0;">💾 Save Credentials</button>
+      <button class="btn btn-danger" id="btn-clear-creds"
+              style="margin-bottom:0;padding:8px 12px;width:auto;"
+              title="Clear saved credentials">🗑</button>
+    </div>
+
+    <!-- Status banner — shown/hidden by popup.js -->
+    <div id="creds-status"></div>
+  </div>
+
+  <div class="footer">Ashley LP Chat Scraper v1.0.3</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
